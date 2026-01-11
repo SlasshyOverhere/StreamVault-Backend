@@ -11,7 +11,17 @@ const PORT = process.env.PORT || 3000;
 // Google OAuth credentials (stored securely on server)
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
 const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
-const REDIRECT_URI = process.env.REDIRECT_URI; // This server's callback URL
+
+// Auto-detect redirect URI from request if not set
+const getRedirectUri = (req) => {
+  if (process.env.REDIRECT_URI) {
+    return process.env.REDIRECT_URI;
+  }
+  // Fallback: construct from request
+  const protocol = req.headers['x-forwarded-proto'] || req.protocol || 'https';
+  const host = req.headers['x-forwarded-host'] || req.headers.host;
+  return `${protocol}://${host}/auth/callback`;
+};
 
 // Scopes for Google Drive
 const SCOPES = [
@@ -21,27 +31,42 @@ const SCOPES = [
 
 // Health check
 app.get('/', (req, res) => {
-  res.json({ status: 'ok', service: 'StreamVault Auth Server' });
+  const redirectUri = getRedirectUri(req);
+  res.json({
+    status: 'ok',
+    service: 'StreamVault Auth Server',
+    redirect_uri: redirectUri,
+    client_id_set: !!GOOGLE_CLIENT_ID,
+    client_secret_set: !!GOOGLE_CLIENT_SECRET
+  });
 });
 
 // Step 1: Initiate OAuth flow
 app.get('/auth/google', (req, res) => {
+  const redirectUri = getRedirectUri(req);
   const state = req.query.state || 'default';
+
+  // Check if credentials are configured
+  if (!GOOGLE_CLIENT_ID) {
+    return res.status(500).json({ error: 'GOOGLE_CLIENT_ID not configured' });
+  }
 
   const authUrl = new URL('https://accounts.google.com/o/oauth2/v2/auth');
   authUrl.searchParams.set('client_id', GOOGLE_CLIENT_ID);
-  authUrl.searchParams.set('redirect_uri', REDIRECT_URI);
+  authUrl.searchParams.set('redirect_uri', redirectUri);
   authUrl.searchParams.set('response_type', 'code');
   authUrl.searchParams.set('scope', SCOPES);
   authUrl.searchParams.set('access_type', 'offline');
   authUrl.searchParams.set('prompt', 'consent');
   authUrl.searchParams.set('state', state);
 
+  console.log('Redirecting to Google with redirect_uri:', redirectUri);
   res.redirect(authUrl.toString());
 });
 
 // Step 2: Handle Google callback
 app.get('/auth/callback', async (req, res) => {
+  const redirectUri = getRedirectUri(req);
   const { code, error } = req.query;
 
   if (error) {
@@ -64,14 +89,15 @@ app.get('/auth/callback', async (req, res) => {
         client_secret: GOOGLE_CLIENT_SECRET,
         code: code,
         grant_type: 'authorization_code',
-        redirect_uri: REDIRECT_URI,
+        redirect_uri: redirectUri,
       }),
     });
 
     const tokens = await tokenResponse.json();
 
     if (tokens.error) {
-      return res.redirect(`http://localhost:8085/callback?error=${encodeURIComponent(tokens.error)}`);
+      console.error('Token error:', tokens);
+      return res.redirect(`http://localhost:8085/callback?error=${encodeURIComponent(tokens.error_description || tokens.error)}`);
     }
 
     // Encode tokens as base64 to pass via URL safely
