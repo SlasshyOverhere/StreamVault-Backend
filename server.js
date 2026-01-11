@@ -29,15 +29,17 @@ const SCOPES = [
   'https://www.googleapis.com/auth/userinfo.email'
 ].join(' ');
 
-// Health check
+// Root - simple response
 app.get('/', (req, res) => {
-  const redirectUri = getRedirectUri(req);
+  res.json({ service: 'StreamVault Auth Server' });
+});
+
+// Health check endpoint for monitoring
+app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
-    service: 'StreamVault Auth Server',
-    redirect_uri: redirectUri,
-    client_id_set: !!GOOGLE_CLIENT_ID,
-    client_secret_set: !!GOOGLE_CLIENT_SECRET
+    timestamp: new Date().toISOString(),
+    configured: !!(GOOGLE_CLIENT_ID && GOOGLE_CLIENT_SECRET)
   });
 });
 
