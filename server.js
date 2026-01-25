@@ -316,23 +316,104 @@ const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: '/ws/watchtogether' });
 
 wss.on('connection', (ws, req) => {
-  // Extract room code from URL: /ws/watchtogether/ROOMCODE
+  // Extract room code from URL: /ws/watchtogether/ROOMCODE or just /ws/watchtogether for create
   const urlParts = req.url.split('/');
-  const roomCode = urlParts[urlParts.length - 1]?.split('?')[0]?.toUpperCase();
+  let roomCode = urlParts[urlParts.length - 1]?.split('?')[0]?.toUpperCase();
+
+  // If roomCode is "watchtogether", it means no room code was provided (creating new room)
+  if (roomCode === 'WATCHTOGETHER' || roomCode === '') {
+    roomCode = null;
+  }
 
   let participantId = null;
   let currentRoom = null;
 
-  console.log(`[WT] WebSocket connection for room: ${roomCode}`);
+  console.log(`[WT] WebSocket connection, room code: ${roomCode || 'none (will create)'}`);
 
   ws.on('message', (data) => {
     try {
       const message = JSON.parse(data.toString());
-      const room = rooms.get(roomCode);
+
+      // Handle room creation first (no room code needed)
+      if (message.type === 'create') {
+        const { media_title, media_id, nickname, client_id } = message;
+
+        if (!media_id || !media_title || !nickname) {
+          ws.send(JSON.stringify({ type: 'error', message: 'media_id, media_title, and nickname required' }));
+          return;
+        }
+
+        // Generate unique room code
+        let newCode;
+        do {
+          newCode = generateRoomCode();
+        } while (rooms.has(newCode));
+
+        const hostId = client_id || uuidv4();
+        const room = {
+          code: newCode,
+          media_id,
+          media_title,
+          host_id: hostId,
+          state: 'waiting',
+          current_position: 0,
+          participants: new Map(),
+          created_at: Date.now(),
+          lastActivity: Date.now()
+        };
+
+        // Add host as first participant
+        room.participants.set(hostId, {
+          id: hostId,
+          nickname: nickname,
+          is_host: true,
+          is_ready: false,
+          joined_at: Date.now(),
+          ws: ws
+        });
+
+        rooms.set(newCode, room);
+        roomCode = newCode;
+        currentRoom = room;
+        participantId = hostId;
+
+        console.log(`[WT] Room created via WebSocket: ${newCode} by ${nickname}`);
+
+        // Send room_created response
+        ws.send(JSON.stringify({
+          type: 'room_created',
+          room: {
+            code: newCode,
+            host_id: hostId,
+            media_id,
+            media_title,
+            is_playing: false,
+            current_position: 0,
+            participants: [{
+              id: hostId,
+              nickname: nickname,
+              is_host: true,
+              is_ready: false
+            }]
+          }
+        }));
+        return;
+      }
+
+      // For other messages, we need a room
+      let room = roomCode ? rooms.get(roomCode) : currentRoom;
+
+      if (!room && message.type === 'join') {
+        // Try to get room from message
+        const joinRoomCode = message.room_code?.toUpperCase();
+        if (joinRoomCode) {
+          room = rooms.get(joinRoomCode);
+          roomCode = joinRoomCode;
+        }
+      }
 
       if (!room) {
         ws.send(JSON.stringify({ type: 'error', message: 'Room not found' }));
-        ws.close();
         return;
       }
 
@@ -342,7 +423,7 @@ wss.on('connection', (ws, req) => {
       switch (message.type) {
         case 'join': {
           // Join room with nickname and client_id
-          const { nickname, client_id } = message;
+          const { nickname, client_id, media_id } = message;
 
           // Check if this is an existing participant reconnecting
           let participant = room.participants.get(client_id);
@@ -360,22 +441,23 @@ wss.on('connection', (ws, req) => {
               is_host: false,
               is_ready: false,
               joined_at: Date.now(),
+              media_id: media_id,
               ws
             };
             room.participants.set(participantId, participant);
           }
 
-          console.log(`[WT] ${nickname} joined room ${roomCode}`);
+          console.log(`[WT] ${nickname} joined room ${room.code}`);
 
-          // Send room state to the joining participant
+          // Send room_joined response to the joining participant
           ws.send(JSON.stringify({
-            type: 'room_state',
+            type: 'room_joined',
             room: {
               code: room.code,
               media_id: room.media_id,
               media_title: room.media_title,
               host_id: room.host_id,
-              state: room.state,
+              is_playing: room.state === 'playing',
               current_position: room.current_position,
               participants: Array.from(room.participants.values()).map(p => ({
                 id: p.id,
@@ -408,21 +490,33 @@ wss.on('connection', (ws, req) => {
               participant.duration = message.duration;
             }
 
-            // Broadcast updated room state
+            console.log(`[WT] ${participant.nickname} is ready in room ${room.code}`);
+
+            // Broadcast to all including sender
             broadcastToRoom(room, {
-              type: 'participant_changed',
+              type: 'participant_ready',
+              participant_id: participantId,
+              duration: message.duration || 0
+            });
+
+            // Also send updated room state
+            broadcastToRoom(room, {
+              type: 'room_state',
               room: getRoomState(room)
             });
           }
           break;
         }
 
+        case 'start':
         case 'start_playback': {
           // Only host can start playback
           const participant = room.participants.get(participantId);
           if (participant && participant.is_host) {
             room.state = 'playing';
             room.current_position = message.position || 0;
+
+            console.log(`[WT] Playback started in room ${room.code}`);
 
             broadcastToRoom(room, {
               type: 'playback_started',
@@ -444,7 +538,7 @@ wss.on('connection', (ws, req) => {
 
           // Broadcast to all other participants
           broadcastToRoom(room, {
-            type: 'sync_command',
+            type: 'sync',
             command,
             from: participantId,
             timestamp: Date.now()
@@ -474,6 +568,7 @@ wss.on('connection', (ws, req) => {
       }
     } catch (err) {
       console.error('[WT] Message parse error:', err);
+      ws.send(JSON.stringify({ type: 'error', message: 'Invalid message format' }));
     }
   });
 
