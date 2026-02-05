@@ -5,11 +5,14 @@ const { WebSocketServer } = require('ws');
 const { v4: uuidv4 } = require('uuid');
 require('dotenv').config();
 
+const social = require('./social');
+const database = require('./database');
+
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 3001;
 
 // Google OAuth credentials (stored securely on server)
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
@@ -76,7 +79,7 @@ setInterval(() => {
 
 // Root - simple response
 app.get('/', (req, res) => {
-  res.json({ service: 'StreamVault Auth Server', version: '1.1.0' });
+  res.json({ service: 'StreamVault Auth Server', version: '1.2.0', features: ['oauth', 'watchtogether', 'social'] });
 });
 
 // Health check endpoint for monitoring
@@ -85,8 +88,253 @@ app.get('/health', (req, res) => {
     status: 'ok',
     timestamp: new Date().toISOString(),
     configured: !!(GOOGLE_CLIENT_ID && GOOGLE_CLIENT_SECRET),
-    activeRooms: rooms.size
+    activeRooms: rooms.size,
+    onlineUsers: social.onlineUsers.size
   });
+});
+
+// ============================================
+// Social API Endpoints
+// ============================================
+
+// Auth middleware for social endpoints
+const socialAuth = async (req, res, next) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'Missing or invalid authorization header' });
+  }
+
+  const accessToken = authHeader.split(' ')[1];
+
+  try {
+    // Verify token with Google
+    const userInfoRes = await fetch('https://www.googleapis.com/oauth2/v2/userinfo', {
+      headers: { 'Authorization': `Bearer ${accessToken}` }
+    });
+
+    if (!userInfoRes.ok) {
+      return res.status(401).json({ error: 'Invalid access token' });
+    }
+
+    const userInfo = await userInfoRes.json();
+    req.googleId = userInfo.id;
+    req.accessToken = accessToken;
+    req.userInfo = userInfo;
+    next();
+  } catch (error) {
+    console.error('[Social Auth] Error:', error);
+    res.status(401).json({ error: 'Authentication failed' });
+  }
+};
+
+// Initialize social profile (called after OAuth)
+app.post('/api/social/init', socialAuth, async (req, res) => {
+  try {
+    const profile = await social.initUserSocial(req.googleId, req.accessToken, req.userInfo);
+    res.json({ success: true, profile });
+  } catch (error) {
+    console.error('[Social] Init error:', error);
+    res.status(500).json({ error: 'Failed to initialize social profile' });
+  }
+});
+
+// Get own profile
+app.get('/api/social/profile', socialAuth, async (req, res) => {
+  try {
+    const profile = await social.getProfile(req.googleId, req.accessToken);
+    res.json(profile);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to get profile' });
+  }
+});
+
+// Update profile
+app.patch('/api/social/profile', socialAuth, async (req, res) => {
+  try {
+    const { displayName, avatarUrl } = req.body;
+    const profile = await social.updateProfile(req.googleId, req.accessToken, { displayName, avatarUrl });
+    res.json(profile);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to update profile' });
+  }
+});
+
+// Update privacy settings
+app.patch('/api/social/privacy', socialAuth, async (req, res) => {
+  try {
+    const profile = await social.updatePrivacySettings(req.googleId, req.accessToken, req.body);
+    res.json(profile.privacySettings);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to update privacy settings' });
+  }
+});
+
+// Get friend profile
+app.get('/api/social/profile/:userId', socialAuth, async (req, res) => {
+  try {
+    const profile = await social.getFriendProfile(req.googleId, req.accessToken, req.params.userId);
+    if (!profile) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    res.json(profile);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to get profile' });
+  }
+});
+
+// Search users
+app.get('/api/social/search', socialAuth, async (req, res) => {
+  try {
+    const { q } = req.query;
+    if (!q || q.length < 2) {
+      return res.json([]);
+    }
+    const results = await social.searchUsers(q, req.googleId);
+    res.json(results);
+  } catch (error) {
+    res.status(500).json({ error: 'Search failed' });
+  }
+});
+
+// Get friends list
+app.get('/api/social/friends', socialAuth, async (req, res) => {
+  try {
+    const friends = await social.getFriends(req.googleId, req.accessToken);
+    const online = social.getOnlineFriends(req.googleId);
+    res.json({ friends, online });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to get friends' });
+  }
+});
+
+// Get pending friend requests
+app.get('/api/social/friends/requests', socialAuth, async (req, res) => {
+  try {
+    const requests = await social.getPendingRequests(req.googleId, req.accessToken);
+    res.json(requests);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to get friend requests' });
+  }
+});
+
+// Send friend request
+app.post('/api/social/friends/request', socialAuth, async (req, res) => {
+  try {
+    const { targetUserId } = req.body;
+    const profile = await social.getProfile(req.googleId, req.accessToken);
+
+    // Get target user's access token from cache
+    const targetProfile = social.userProfiles.get(targetUserId);
+    if (!targetProfile) {
+      return res.status(404).json({ error: 'User not found or not online' });
+    }
+
+    await social.sendFriendRequest(
+      req.googleId,
+      profile.displayName,
+      profile.avatarUrl,
+      targetUserId,
+      targetProfile.accessToken
+    );
+    res.json({ success: true });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+// Accept friend request
+app.post('/api/social/friends/accept', socialAuth, async (req, res) => {
+  try {
+    const { fromUserId } = req.body;
+    await social.acceptFriendRequest(req.googleId, req.accessToken, fromUserId);
+    res.json({ success: true });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+// Reject friend request
+app.post('/api/social/friends/reject', socialAuth, async (req, res) => {
+  try {
+    const { fromUserId } = req.body;
+    await social.rejectFriendRequest(req.googleId, req.accessToken, fromUserId);
+    res.json({ success: true });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+// Remove friend
+app.delete('/api/social/friends/:friendId', socialAuth, async (req, res) => {
+  try {
+    await social.removeFriend(req.googleId, req.accessToken, req.params.friendId);
+    res.json({ success: true });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+// Log activity
+app.post('/api/social/activity', socialAuth, async (req, res) => {
+  try {
+    const activity = await social.logActivity(req.googleId, req.accessToken, req.body);
+    res.json(activity);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to log activity' });
+  }
+});
+
+// Get own activity
+app.get('/api/social/activity', socialAuth, async (req, res) => {
+  try {
+    const activities = await social.getActivity(req.googleId, req.accessToken);
+    res.json(activities);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to get activity' });
+  }
+});
+
+// Get friends' activity feed
+app.get('/api/social/activity/feed', socialAuth, async (req, res) => {
+  try {
+    const { contentType, genre, userId } = req.query;
+    const activities = await social.getFriendsActivity(req.googleId, req.accessToken, {
+      contentType, genre, userId
+    });
+    res.json(activities);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to get activity feed' });
+  }
+});
+
+// Sync stats from local app
+app.post('/api/social/stats/sync', socialAuth, async (req, res) => {
+  try {
+    const profile = await social.updateStats(req.googleId, req.accessToken, req.body);
+    res.json(profile?.stats || {});
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to sync stats' });
+  }
+});
+
+// Get friends currently watching
+app.get('/api/social/watching', socialAuth, async (req, res) => {
+  try {
+    const watching = social.getFriendsCurrentlyWatching(req.googleId);
+    res.json(watching);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to get watching status' });
+  }
+});
+
+// Get chat history
+app.get('/api/social/chat/:friendId', socialAuth, async (req, res) => {
+  try {
+    const messages = await social.loadChatHistory(req.googleId, req.accessToken, req.params.friendId);
+    res.json(messages);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to load chat history' });
+  }
 });
 
 // Create a new Watch Together room
@@ -314,6 +562,47 @@ const server = http.createServer(app);
 
 // WebSocket server for Watch Together
 const wss = new WebSocketServer({ server, path: '/ws/watchtogether' });
+
+// WebSocket server for Social features
+const socialWss = new WebSocketServer({ server, path: '/ws/social' });
+
+socialWss.on('connection', async (ws, req) => {
+  // Extract access token from query string
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  const accessToken = url.searchParams.get('token');
+
+  if (!accessToken) {
+    ws.close(1008, 'Missing access token');
+    return;
+  }
+
+  try {
+    // Verify token with Google
+    const userInfoRes = await fetch('https://www.googleapis.com/oauth2/v2/userinfo', {
+      headers: { 'Authorization': `Bearer ${accessToken}` }
+    });
+
+    if (!userInfoRes.ok) {
+      ws.close(1008, 'Invalid access token');
+      return;
+    }
+
+    const userInfo = await userInfoRes.json();
+    const googleId = userInfo.id;
+
+    console.log(`[Social WS] User connected: ${userInfo.email}`);
+
+    // Initialize social profile if not exists
+    await social.initUserSocial(googleId, accessToken, userInfo);
+
+    // Handle social WebSocket connection
+    social.handleSocialConnection(ws, googleId, accessToken);
+
+  } catch (error) {
+    console.error('[Social WS] Connection error:', error);
+    ws.close(1011, 'Server error');
+  }
+});
 
 wss.on('connection', (ws, req) => {
   // Extract room code from URL: /ws/watchtogether/ROOMCODE or just /ws/watchtogether for create
@@ -643,7 +932,13 @@ function getRoomState(room) {
 }
 
 // Start server
-server.listen(PORT, () => {
-  console.log(`StreamVault Auth Server running on port ${PORT}`);
-  console.log(`WebSocket endpoint: ws://localhost:${PORT}/ws/watchtogether/{roomCode}`);
-});
+(async () => {
+  // Initialize Turso database
+  await database.initDatabase();
+
+  server.listen(PORT, () => {
+    console.log(`StreamVault Auth Server running on port ${PORT}`);
+    console.log(`WebSocket endpoint: ws://localhost:${PORT}/ws/watchtogether/{roomCode}`);
+    console.log(`Database connected: ${database.isConnected()}`);
+  });
+})();
