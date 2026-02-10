@@ -42,6 +42,11 @@ const SCOPES = [
 // In-memory room storage (use Redis in production for scaling)
 const rooms = new Map();
 
+// Syncplay-inspired constants
+const SYNC_BROADCAST_INTERVAL = 1000; // Broadcast state updates every 1s
+const PING_INTERVAL = 2000; // Ping clients every 2s for RTT measurement
+const PING_MOVING_AVG_WEIGHT = 0.85; // Moving average weight for RTT smoothing
+
 // Room cleanup interval (remove inactive rooms after 1 hour)
 const ROOM_TIMEOUT = 60 * 60 * 1000; // 1 hour
 const ROOM_CLEANUP_INTERVAL = 5 * 60 * 1000; // Check every 5 minutes
@@ -62,6 +67,7 @@ setInterval(() => {
   for (const [code, room] of rooms.entries()) {
     if (now - room.lastActivity > ROOM_TIMEOUT) {
       console.log(`[WT] Cleaning up inactive room: ${code}`);
+      stopRoomSyncTimers(room);
       // Close all connections in the room
       for (const participant of room.participants.values()) {
         if (participant.ws && participant.ws.readyState === 1) {
@@ -646,9 +652,13 @@ wss.on('connection', (ws, req) => {
           host_id: hostId,
           state: 'waiting',
           current_position: 0,
+          is_paused: true,
+          position_updated_at: Date.now(), // Track when position was last set
           participants: new Map(),
           created_at: Date.now(),
-          lastActivity: Date.now()
+          lastActivity: Date.now(),
+          syncInterval: null, // Will hold the periodic state broadcast timer
+          pingInterval: null, // Will hold the periodic ping timer
         };
 
         // Add host as first participant
@@ -658,8 +668,17 @@ wss.on('connection', (ws, req) => {
           is_host: true,
           is_ready: false,
           joined_at: Date.now(),
-          ws: ws
+          ws: ws,
+          rtt: 0, // Round-trip time in ms
+          rttAvg: 0, // Smoothed RTT (moving average)
+          pendingPings: new Map(), // pingId -> sendTimestamp
+          lastPosition: 0, // Last reported position
+          lastPaused: true, // Last reported pause state
+          lastStateReport: Date.now(),
         });
+
+        // Start periodic ping + state broadcast for this room
+        startRoomSyncTimers(room);
 
         rooms.set(newCode, room);
         roomCode = newCode;
@@ -731,7 +750,13 @@ wss.on('connection', (ws, req) => {
               is_ready: false,
               joined_at: Date.now(),
               media_id: media_id,
-              ws
+              ws,
+              rtt: 0,
+              rttAvg: 0,
+              pendingPings: new Map(),
+              lastPosition: 0,
+              lastPaused: true,
+              lastStateReport: Date.now(),
             };
             room.participants.set(participantId, participant);
           }
@@ -803,7 +828,9 @@ wss.on('connection', (ws, req) => {
           const participant = room.participants.get(participantId);
           if (participant && participant.is_host) {
             room.state = 'playing';
+            room.is_paused = false;
             room.current_position = message.position || 0;
+            room.position_updated_at = Date.now();
 
             console.log(`[WT] Playback started in room ${room.code}`);
 
@@ -817,21 +844,80 @@ wss.on('connection', (ws, req) => {
         }
 
         case 'sync': {
-          // Sync command from a participant
+          // Sync command from a participant (play/pause/seek)
           const { command } = message;
           if (!command) break;
 
+          const now = Date.now();
           room.current_position = command.position || room.current_position;
-          if (command.action === 'play') room.state = 'playing';
-          if (command.action === 'pause') room.state = 'paused';
+          room.position_updated_at = now;
 
-          // Broadcast to all other participants
-          broadcastToRoom(room, {
-            type: 'sync',
-            command,
-            from: participantId,
-            timestamp: Date.now()
-          }, participantId);
+          if (command.action === 'play') {
+            room.state = 'playing';
+            room.is_paused = false;
+          }
+          if (command.action === 'pause') {
+            room.state = 'paused';
+            room.is_paused = true;
+          }
+
+          // Broadcast to ALL participants (including sender with a flag)
+          // Each client uses ignoringOnTheFly to suppress echo
+          for (const [id, p] of room.participants) {
+            if (p.ws && p.ws.readyState === 1) {
+              const msg = {
+                type: 'sync',
+                command,
+                from: participantId,
+                timestamp: now,
+                is_echo: id === participantId, // Let sender know this is their own echo
+              };
+              p.ws.send(JSON.stringify(msg));
+            }
+          }
+          break;
+        }
+
+        case 'state_report': {
+          // Continuous state report from client (sent every ~1s)
+          // This is the Syncplay-style "State" message
+          const participant = room.participants.get(participantId);
+          if (participant) {
+            participant.lastPosition = message.position || 0;
+            participant.lastPaused = message.paused !== undefined ? message.paused : participant.lastPaused;
+            participant.lastStateReport = Date.now();
+          }
+          break;
+        }
+
+        case 'ping': {
+          // RTT measurement - client sends ping, server responds with pong
+          const participant = room.participants.get(participantId);
+          if (participant) {
+            ws.send(JSON.stringify({
+              type: 'pong',
+              ping_id: message.ping_id,
+              server_time: Date.now(),
+              // Include the sender's last known RTT so other clients can use it
+              your_rtt: participant.rttAvg,
+            }));
+          }
+          break;
+        }
+
+        case 'pong_report': {
+          // Client reports its measured RTT after receiving pong
+          const participant = room.participants.get(participantId);
+          if (participant && message.rtt !== undefined) {
+            participant.rtt = message.rtt;
+            // Moving average RTT (Syncplay-style)
+            if (participant.rttAvg === 0) {
+              participant.rttAvg = message.rtt;
+            } else {
+              participant.rttAvg = participant.rttAvg * PING_MOVING_AVG_WEIGHT
+                + message.rtt * (1 - PING_MOVING_AVG_WEIGHT);
+            }
+          }
           break;
         }
 
@@ -840,7 +926,7 @@ wss.on('connection', (ws, req) => {
           if (message.position !== undefined) {
             const participant = room.participants.get(participantId);
             if (participant) {
-              participant.last_position = message.position;
+              participant.lastPosition = message.position;
             }
           }
           ws.send(JSON.stringify({ type: 'heartbeat_ack', timestamp: Date.now() }));
@@ -873,6 +959,87 @@ wss.on('connection', (ws, req) => {
   });
 });
 
+// Compute the server's authoritative position by advancing from last known position
+function getServerPosition(room) {
+  if (room.is_paused || room.state !== 'playing') {
+    return room.current_position;
+  }
+  const elapsed = (Date.now() - room.position_updated_at) / 1000.0;
+  return room.current_position + elapsed;
+}
+
+// Start periodic sync timers for a room
+function startRoomSyncTimers(room) {
+  // Clear existing timers if any
+  if (room.syncInterval) clearInterval(room.syncInterval);
+  if (room.pingInterval) clearInterval(room.pingInterval);
+
+  // Periodic state broadcast: send each client the authoritative position
+  // adjusted for their individual RTT (Syncplay-style forward delay)
+  room.syncInterval = setInterval(() => {
+    if (room.state !== 'playing' && room.state !== 'paused') return;
+
+    const serverPos = getServerPosition(room);
+    const now = Date.now();
+
+    for (const [id, participant] of room.participants) {
+      if (!participant.ws || participant.ws.readyState !== 1) continue;
+
+      // Calculate forward delay: how far ahead this client should be
+      // to compensate for network latency (RTT/2 = one-way delay)
+      const forwardDelay = participant.rttAvg / 2000.0; // Convert ms to seconds
+
+      const msg = {
+        type: 'state_update',
+        position: serverPos + forwardDelay, // Compensate for delivery delay
+        paused: room.is_paused,
+        server_time: now,
+        your_rtt: participant.rttAvg,
+        // Include all participants' positions for OSD display
+        participants: Array.from(room.participants.values()).map(p => ({
+          id: p.id,
+          nickname: p.nickname,
+          position: p.lastPosition,
+          paused: p.lastPaused,
+          rtt: Math.round(p.rttAvg),
+        })),
+      };
+      participant.ws.send(JSON.stringify(msg));
+    }
+
+    // Advance the server's stored position
+    room.current_position = serverPos;
+    room.position_updated_at = now;
+  }, SYNC_BROADCAST_INTERVAL);
+
+  // Periodic ping for RTT measurement
+  room.pingInterval = setInterval(() => {
+    const now = Date.now();
+    for (const [id, participant] of room.participants) {
+      if (!participant.ws || participant.ws.readyState !== 1) continue;
+
+      const pingId = `${id}-${now}`;
+      participant.ws.send(JSON.stringify({
+        type: 'ping',
+        ping_id: pingId,
+        server_time: now,
+      }));
+    }
+  }, PING_INTERVAL);
+}
+
+// Stop sync timers for a room
+function stopRoomSyncTimers(room) {
+  if (room.syncInterval) {
+    clearInterval(room.syncInterval);
+    room.syncInterval = null;
+  }
+  if (room.pingInterval) {
+    clearInterval(room.pingInterval);
+    room.pingInterval = null;
+  }
+}
+
 function handleParticipantLeave(room, participantId) {
   const participant = room.participants.get(participantId);
   if (!participant) return;
@@ -890,8 +1057,9 @@ function handleParticipantLeave(room, participantId) {
     console.log(`[WT] New host: ${newHost.nickname}`);
   }
 
-  // If room is empty, delete it
+  // If room is empty, delete it and stop timers
   if (room.participants.size === 0) {
+    stopRoomSyncTimers(room);
     rooms.delete(room.code);
     console.log(`[WT] Room ${room.code} deleted (empty)`);
     return;
