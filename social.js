@@ -12,6 +12,13 @@
 const { v4: uuidv4 } = require('uuid');
 const database = require('./database');
 
+const SOCIAL_DEBUG_LOGS = process.env.SOCIAL_DEBUG_LOGS === '1';
+
+function socialDebugLog(...args) {
+  if (!SOCIAL_DEBUG_LOGS) return;
+  console.log(...args);
+}
+
 // In-memory caches (will be synced with Google Drive)
 const userProfiles = new Map();
 const friendships = new Map();
@@ -30,10 +37,10 @@ const CHAT_FOLDER = 'chats';
  * Generate username from email
  */
 function generateUsernameFromEmail(email) {
-  console.log('[Social] Generating username from email:', email);
+  socialDebugLog('[Social] Generating username from email:', email);
   if (!email) return `user_${Date.now()}`;
   const username = email.split('@')[0]?.toLowerCase().replace(/[^a-z0-9_]/g, '_');
-  console.log('[Social] Generated username:', username);
+  socialDebugLog('[Social] Generated username:', username);
   return username || `user_${Date.now()}`;
 }
 
@@ -41,24 +48,24 @@ function generateUsernameFromEmail(email) {
  * Initialize social features for a user
  */
 async function initUserSocial(googleId, accessToken, userInfo) {
-  console.log('[Social] initUserSocial called for:', googleId);
-  console.log('[Social] userInfo:', JSON.stringify(userInfo, null, 2));
+  socialDebugLog('[Social] initUserSocial called for:', googleId);
+  socialDebugLog('[Social] userInfo:', JSON.stringify(userInfo, null, 2));
 
   try {
     // Check if social folder exists in Drive
-    console.log('[Social] Getting or creating social folder...');
+    socialDebugLog('[Social] Getting or creating social folder...');
     const folderId = await getOrCreateSocialFolder(accessToken);
-    console.log('[Social] Folder ID:', folderId);
+    socialDebugLog('[Social] Folder ID:', folderId);
 
     // Load or create profile
-    console.log('[Social] Loading profile...');
+    socialDebugLog('[Social] Loading profile...');
     let profile = await loadFileFromDrive(accessToken, folderId, PROFILE_FILE);
-    console.log('[Social] Existing profile:', profile ? JSON.stringify(profile, null, 2) : 'not found');
+    socialDebugLog('[Social] Existing profile:', profile ? JSON.stringify(profile, null, 2) : 'not found');
 
     let needsSave = false;
 
     if (!profile) {
-      console.log('[Social] Creating new profile...');
+      socialDebugLog('[Social] Creating new profile...');
       // Generate username from email (remove @gmail.com, @domain.com, etc.)
       const username = generateUsernameFromEmail(userInfo.email);
 
@@ -93,14 +100,14 @@ async function initUserSocial(googleId, accessToken, userInfo) {
     } else {
       // Migration: Update email from userInfo if missing
       if (!profile.email && userInfo.email) {
-        console.log('[Social] Profile missing email, adding from userInfo...');
+        socialDebugLog('[Social] Profile missing email, adding from userInfo...');
         profile.email = userInfo.email;
         needsSave = true;
       }
 
       // Migration: Check if existing profile is missing username
       if (!profile.username || profile.username.trim() === '') {
-        console.log('[Social] Profile missing username, generating from email...');
+        socialDebugLog('[Social] Profile missing username, generating from email...');
         const emailToUse = profile.email || userInfo.email;
         profile.username = generateUsernameFromEmail(emailToUse);
         needsSave = true;
@@ -108,7 +115,7 @@ async function initUserSocial(googleId, accessToken, userInfo) {
 
       // Migration: Update avatar from userInfo if missing
       if (!profile.avatarUrl && userInfo.picture) {
-        console.log('[Social] Profile missing avatar, adding from userInfo...');
+        socialDebugLog('[Social] Profile missing avatar, adding from userInfo...');
         profile.avatarUrl = userInfo.picture;
         needsSave = true;
       }
@@ -132,16 +139,16 @@ async function initUserSocial(googleId, accessToken, userInfo) {
       }
     }
 
-    console.log('[Social] Profile after migration:', JSON.stringify(profile, null, 2));
-    console.log('[Social] Needs save:', needsSave);
+    socialDebugLog('[Social] Profile after migration:', JSON.stringify(profile, null, 2));
+    socialDebugLog('[Social] Needs save:', needsSave);
 
     if (needsSave) {
       const saved = await saveFileToDrive(accessToken, folderId, PROFILE_FILE, profile);
-      console.log('[Social] Profile save result:', saved);
+      socialDebugLog('[Social] Profile save result:', saved);
     }
 
     userProfiles.set(googleId, { ...profile, folderId, accessToken });
-    console.log('[Social] Profile cached, returning:', profile.displayName, 'username:', profile.username);
+    socialDebugLog('[Social] Profile cached, returning:', profile.displayName, 'username:', profile.username);
 
     // Register/update user in Turso for persistent search
     await database.upsertUser({
@@ -168,7 +175,7 @@ async function getOrCreateSocialFolder(accessToken) {
   try {
     const searchUrl = `https://www.googleapis.com/drive/v3/files?q=name='${SOCIAL_FOLDER}' and mimeType='application/vnd.google-apps.folder' and trashed=false&fields=files(id,name)`;
 
-    console.log('[Social] Searching for folder...');
+    socialDebugLog('[Social] Searching for folder...');
     const searchRes = await fetch(searchUrl, {
       headers: { 'Authorization': `Bearer ${accessToken}` }
     });
@@ -180,15 +187,15 @@ async function getOrCreateSocialFolder(accessToken) {
     }
 
     const searchData = await searchRes.json();
-    console.log('[Social] Search result:', searchData);
+    socialDebugLog('[Social] Search result:', searchData);
 
     if (searchData.files && searchData.files.length > 0) {
-      console.log('[Social] Found existing folder:', searchData.files[0].id);
+      socialDebugLog('[Social] Found existing folder:', searchData.files[0].id);
       return searchData.files[0].id;
     }
 
     // Create folder
-    console.log('[Social] Creating new folder...');
+    socialDebugLog('[Social] Creating new folder...');
     const createRes = await fetch('https://www.googleapis.com/drive/v3/files', {
       method: 'POST',
       headers: {
@@ -208,7 +215,7 @@ async function getOrCreateSocialFolder(accessToken) {
     }
 
     const folder = await createRes.json();
-    console.log('[Social] Created folder:', folder.id);
+    socialDebugLog('[Social] Created folder:', folder.id);
     return folder.id;
   } catch (error) {
     console.error('[Social] getOrCreateSocialFolder error:', error.message || error);
@@ -540,14 +547,12 @@ async function logActivity(googleId, accessToken, activity) {
     });
   }
 
-  // Notify friends who are online
-  const friends = await getFriends(googleId, accessToken);
-  for (const friend of friends) {
-    const friendWs = onlineUsers.get(friend.id)?.ws;
-    if (friendWs && friendWs.readyState === 1) {
-      // Check if friend allows seeing activity
-      const friendProfile = userProfiles.get(friend.id);
-      if (friendProfile?.privacySettings?.showActivityToFriends !== false) {
+  // Notify online friends only when the user allows activity sharing.
+  if (cached.privacySettings?.showActivityToFriends !== false) {
+    const friends = await getFriends(googleId, accessToken);
+    for (const friend of friends) {
+      const friendWs = onlineUsers.get(friend.id)?.ws;
+      if (friendWs && friendWs.readyState === 1) {
         friendWs.send(JSON.stringify({
           type: 'friend_activity',
           activity: { ...newActivity, userId: googleId, userName: cached.displayName }
@@ -569,20 +574,34 @@ async function getActivity(googleId, accessToken) {
 
 async function getFriendsActivity(googleId, accessToken, filters = {}) {
   const friends = await getFriends(googleId, accessToken);
-  const allActivities = [];
 
-  for (const friend of friends) {
+  // Load all friends' activities in parallel instead of sequentially
+  const eligibleFriends = friends.filter(friend => {
     const friendProfile = userProfiles.get(friend.id);
-    if (friendProfile && friendProfile.privacySettings?.showActivityToFriends !== false) {
+    return friendProfile && friendProfile.privacySettings?.showActivityToFriends !== false;
+  });
+
+  const activityResults = await Promise.allSettled(
+    eligibleFriends.map(async (friend) => {
+      const friendProfile = userProfiles.get(friend.id);
       const friendActivity = await loadFileFromDrive(friendProfile.accessToken, friendProfile.folderId, ACTIVITY_FILE);
       if (friendActivity?.activities) {
-        allActivities.push(...friendActivity.activities.map(a => ({
+        return friendActivity.activities.map(a => ({
           ...a,
           userId: friend.id,
           userName: friend.name,
           userAvatar: friend.avatar
-        })));
+        }));
       }
+      return [];
+    })
+  );
+
+  // Collect all successful results, skip failed ones gracefully
+  const allActivities = [];
+  for (const result of activityResults) {
+    if (result.status === 'fulfilled' && result.value) {
+      allActivities.push(...result.value);
     }
   }
 
