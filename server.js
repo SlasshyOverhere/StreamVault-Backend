@@ -1826,7 +1826,6 @@ app.get('/', (req, res) => {
   res.json({
     service: 'StreamVault Auth Server',
     version: '1.2.0',
-    features: ['oauth', 'watchtogether', 'social', 'tmdb_proxy', 'ai_proxy', 'ai_upgrade_requests']
   });
 });
 
