@@ -327,6 +327,7 @@ async function run() {
       type: 'create',
       media_id: 424242,
       media_title: 'Sync Test Film',
+      media_match_key: 'cloud:host-file-id|file:sync-test-film.mp4|title:sync test film',
       nickname: 'Host',
       client_id: hostClientId,
     });
@@ -346,6 +347,8 @@ async function run() {
       type: 'join',
       room_code: roomCode,
       media_id: 424242,
+      media_title: 'Sync Test Film',
+      media_match_key: 'cloud:guest-different-id|file:sync-test-film.mp4|title:sync test film',
       nickname: 'Guest',
       client_id: guestClientId,
     });
@@ -366,6 +369,8 @@ async function run() {
       type: 'join',
       room_code: roomCode,
       media_id: 111111,
+      media_title: 'Completely Different Film',
+      media_match_key: 'cloud:stray-id|file:another-film.mp4|title:completely different film',
       nickname: 'WrongMedia',
       client_id: `stray-${Date.now()}`,
     });

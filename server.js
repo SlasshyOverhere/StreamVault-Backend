@@ -1799,6 +1799,34 @@ function generateRoomCode() {
   return code;
 }
 
+function normalizeMediaMatchKey(value) {
+  if (value === undefined || value === null) {
+    return '';
+  }
+  return value.toString().trim().toLowerCase();
+}
+
+function extractMediaMatchKeys(value) {
+  const normalized = normalizeMediaMatchKey(value);
+  if (!normalized) {
+    return [];
+  }
+  return normalized
+    .split('|')
+    .map((token) => token.trim())
+    .filter(Boolean);
+}
+
+function hasMatchingMediaKey(roomKeyValue, joinKeyValue) {
+  const roomKeys = extractMediaMatchKeys(roomKeyValue);
+  const joinKeys = extractMediaMatchKeys(joinKeyValue);
+  if (roomKeys.length === 0 || joinKeys.length === 0) {
+    return null;
+  }
+  const roomSet = new Set(roomKeys);
+  return joinKeys.some((key) => roomSet.has(key));
+}
+
 // Clean up inactive rooms
 setInterval(() => {
   const now = Date.now();
@@ -3584,7 +3612,7 @@ app.get('/api/social/chat/:friendId', socialAuth, async (req, res) => {
 
 // Create a new Watch Together room
 app.post('/api/watchtogether/rooms', (req, res) => {
-  const { media_id, media_title, host_nickname } = req.body;
+  const { media_id, media_title, media_match_key, host_nickname } = req.body;
 
   if (!media_id || !media_title || !host_nickname) {
     return res.status(400).json({ error: 'media_id, media_title, and host_nickname required' });
@@ -3601,6 +3629,7 @@ app.post('/api/watchtogether/rooms', (req, res) => {
     code,
     media_id,
     media_title,
+    media_match_key: normalizeMediaMatchKey(media_match_key),
     host_id: hostId,
     state: 'waiting', // waiting, playing, paused
     current_position: 0,
@@ -3920,7 +3949,7 @@ wss.on('connection', (ws, req) => {
 
       // Handle room creation first (no room code needed)
       if (message.type === 'create') {
-        const { media_title, media_id, nickname, client_id } = message;
+        const { media_title, media_id, media_match_key, nickname, client_id } = message;
 
         if (!media_id || !media_title || !nickname) {
           ws.send(JSON.stringify({ type: 'error', message: 'media_id, media_title, and nickname required' }));
@@ -3938,6 +3967,7 @@ wss.on('connection', (ws, req) => {
           code: newCode,
           media_id,
           media_title,
+          media_match_key: normalizeMediaMatchKey(media_match_key),
           host_id: hostId,
           state: 'waiting',
           current_position: 0,
@@ -4022,7 +4052,7 @@ wss.on('connection', (ws, req) => {
       switch (message.type) {
         case 'join': {
           // Join room with nickname and client_id
-          const { nickname, client_id, media_id } = message;
+          const { nickname, client_id, media_id, media_title, media_match_key } = message;
           const normalizedNickname = (nickname || '').toString().trim();
 
           if (!client_id || !normalizedNickname) {
@@ -4030,8 +4060,30 @@ wss.on('connection', (ws, req) => {
             break;
           }
 
-          // Enforce media compatibility for consistent sync
-          if (media_id !== undefined && Number(media_id) !== Number(room.media_id)) {
+          // Enforce media compatibility for consistent sync.
+          // Prefer explicit match keys (cloud_file_id, file name, tmdb, title tokens), then title, then legacy media_id.
+          const hasMatchingKey = hasMatchingMediaKey(room.media_match_key, media_match_key);
+          const normalizedRoomTitle = (room.media_title || '').toString().trim().toLowerCase();
+          const normalizedJoinTitle = (media_title || '').toString().trim().toLowerCase();
+
+          if (hasMatchingKey !== null) {
+            if (!hasMatchingKey) {
+              ws.send(JSON.stringify({
+                type: 'error',
+                message: `This room is watching a different media item ("${room.media_title}", room media_id: ${room.media_id})`
+              }));
+              break;
+            }
+          } else if (normalizedRoomTitle && normalizedJoinTitle) {
+            if (normalizedJoinTitle !== normalizedRoomTitle) {
+              ws.send(JSON.stringify({
+                type: 'error',
+                message: `This room is watching a different media item ("${room.media_title}", room media_id: ${room.media_id})`
+              }));
+              break;
+            }
+          } else if (media_id !== undefined && Number(media_id) !== Number(room.media_id)) {
+            // Backward compatibility for clients that don't send media_title.
             ws.send(JSON.stringify({
               type: 'error',
               message: `This room is watching a different media item (room media_id: ${room.media_id})`
