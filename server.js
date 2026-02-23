@@ -1780,6 +1780,8 @@ const rooms = new Map();
 const SYNC_BROADCAST_INTERVAL = 500; // Broadcast state updates every 0.5s
 const PING_INTERVAL = 2000; // Ping clients every 2s for RTT measurement
 const PING_MOVING_AVG_WEIGHT = 0.85; // Moving average weight for RTT smoothing
+const STATE_REPORT_CORRECTION_THRESHOLD = 0.45; // Pull server state toward authority when drift grows
+const SYNC_SOURCE_TTL_MS = 12000; // Authority handoff timeout in collaborative mode
 const WT_SYNC_MODE = ['host_only', 'collaborative'].includes(process.env.WT_SYNC_MODE)
   ? process.env.WT_SYNC_MODE
   : 'collaborative';
@@ -1825,6 +1827,38 @@ function hasMatchingMediaKey(roomKeyValue, joinKeyValue) {
   }
   const roomSet = new Set(roomKeys);
   return joinKeys.some((key) => roomSet.has(key));
+}
+
+function normalizeSyncAction(action) {
+  const normalized = (action || '').toString().trim().toLowerCase();
+  if (normalized === 'resume') return 'play';
+  if (normalized === 'play' || normalized === 'pause' || normalized === 'seek') {
+    return normalized;
+  }
+  return null;
+}
+
+function normalizeSyncPosition(position, fallback = 0) {
+  const parsed = Number(position);
+  if (Number.isFinite(parsed)) {
+    return Math.max(0, parsed);
+  }
+  const fallbackNumber = Number(fallback);
+  if (Number.isFinite(fallbackNumber)) {
+    return Math.max(0, fallbackNumber);
+  }
+  return 0;
+}
+
+function canParticipantDriveRoomState(room, participantId, participant, now) {
+  if (!participant) return false;
+  if (room.sync_mode === 'host_only') {
+    return participant.is_host;
+  }
+  if (room.last_sync_from && room.last_sync_at && (now - room.last_sync_at) <= SYNC_SOURCE_TTL_MS) {
+    return room.last_sync_from === participantId;
+  }
+  return participant.is_host;
 }
 
 // Clean up inactive rooms
@@ -2234,6 +2268,7 @@ const socialAuth = async (req, res, next) => {
     req.googleId = userInfo.id;
     req.accessToken = accessToken;
     req.userInfo = userInfo;
+    social.touchUserSession(req.googleId, accessToken);
     next();
   } catch (error) {
     console.error('[Social Auth] Error:', error);
@@ -3424,8 +3459,20 @@ app.get('/api/social/profile', socialAuth, async (req, res) => {
 // Update profile
 app.patch('/api/social/profile', socialAuth, async (req, res) => {
   try {
-    const { displayName, avatarUrl } = req.body;
-    const profile = await social.updateProfile(req.googleId, req.accessToken, { displayName, avatarUrl });
+    const {
+      displayName,
+      avatarUrl,
+      bio,
+      favoriteGenre,
+      location
+    } = req.body || {};
+    const profile = await social.updateProfile(req.googleId, req.accessToken, {
+      displayName,
+      avatarUrl,
+      bio,
+      favoriteGenre,
+      location
+    });
     res.json(profile);
   } catch (error) {
     res.status(500).json({ error: 'Failed to update profile' });
@@ -3473,7 +3520,7 @@ app.get('/api/social/search', socialAuth, async (req, res) => {
 app.get('/api/social/friends', socialAuth, async (req, res) => {
   try {
     const friends = await social.getFriends(req.googleId, req.accessToken);
-    const online = social.getOnlineFriends(req.googleId);
+    const online = await social.getOnlineFriends(req.googleId, req.accessToken);
     res.json({ friends, online });
   } catch (error) {
     res.status(500).json({ error: 'Failed to get friends' });
@@ -3593,7 +3640,7 @@ app.post('/api/social/stats/sync', socialAuth, async (req, res) => {
 // Get friends currently watching
 app.get('/api/social/watching', socialAuth, async (req, res) => {
   try {
-    const watching = social.getFriendsCurrentlyWatching(req.googleId);
+    const watching = await social.getFriendsCurrentlyWatching(req.googleId, req.accessToken);
     res.json(watching);
   } catch (error) {
     res.status(500).json({ error: 'Failed to get watching status' });
@@ -3607,6 +3654,35 @@ app.get('/api/social/chat/:friendId', socialAuth, async (req, res) => {
     res.json(messages);
   } catch (error) {
     res.status(500).json({ error: 'Failed to load chat history' });
+  }
+});
+
+// Send direct message to friend (HTTP fallback + durable write path)
+app.post('/api/social/chat/:friendId', socialAuth, async (req, res) => {
+  try {
+    const friendId = (req.params.friendId || '').trim();
+    const text = typeof req.body?.text === 'string' ? req.body.text : '';
+
+    if (!friendId) {
+      return res.status(400).json({ error: 'Missing friendId' });
+    }
+
+    const savedMessage = await social.saveChatMessage(req.googleId, req.accessToken, friendId, { text });
+    if (!savedMessage) {
+      return res.status(500).json({ error: 'Failed to save message' });
+    }
+
+    social.emitRealtimeChatDelivery(req.googleId, friendId, savedMessage, {
+      emitToSender: false
+    });
+
+    return res.json({ success: true, message: savedMessage, friendId });
+  } catch (error) {
+    const message = String(error?.message || '');
+    if (message.includes('Can only message friends') || message.includes('Message cannot be empty')) {
+      return res.status(400).json({ error: message });
+    }
+    return res.status(500).json({ error: 'Failed to send message' });
   }
 });
 
@@ -3639,6 +3715,8 @@ app.post('/api/watchtogether/rooms', (req, res) => {
     participants: new Map(),
     created_at: Date.now(),
     lastActivity: Date.now(),
+    last_sync_from: hostId,
+    last_sync_at: Date.now(),
     syncInterval: null,
     pingInterval: null,
   };
@@ -3901,17 +3979,12 @@ socialWss.on('connection', async (ws, req) => {
   }
 
   try {
-    // Verify token with Google
-    const userInfoRes = await fetch('https://www.googleapis.com/oauth2/v2/userinfo', {
-      headers: { 'Authorization': `Bearer ${accessToken}` }
-    });
-
-    if (!userInfoRes.ok) {
+    const userInfo = await resolveGoogleUserFromAccessToken(accessToken);
+    if (!userInfo) {
       ws.close(1008, 'Invalid access token');
       return;
     }
 
-    const userInfo = await userInfoRes.json();
     const googleId = userInfo.id;
 
     wtDebugLog(`[Social WS] User connected: ${userInfo.email}`);
@@ -3977,6 +4050,8 @@ wss.on('connection', (ws, req) => {
           participants: new Map(),
           created_at: Date.now(),
           lastActivity: Date.now(),
+          last_sync_from: hostId,
+          last_sync_at: Date.now(),
           syncInterval: null, // Will hold the periodic state broadcast timer
           pingInterval: null, // Will hold the periodic ping timer
         };
@@ -4215,17 +4290,23 @@ wss.on('connection', (ws, req) => {
           }
 
           if (participant && participant.is_host) {
+            const now = Date.now();
             room.state = 'playing';
             room.is_paused = false;
-            room.current_position = message.position ?? 0;
-            room.position_updated_at = Date.now();
+            room.current_position = normalizeSyncPosition(message.position, 0);
+            room.position_updated_at = now;
+            room.last_sync_from = participantId;
+            room.last_sync_at = now;
+            participant.lastPosition = room.current_position;
+            participant.lastPaused = false;
+            participant.lastStateReport = now;
 
             wtDebugLog(`[WT] Playback started in room ${room.code}`);
 
             broadcastToRoom(room, {
               type: 'playback_started',
               position: room.current_position,
-              timestamp: Date.now()
+              timestamp: now
             });
           }
           break;
@@ -4243,20 +4324,35 @@ wss.on('connection', (ws, req) => {
             break;
           }
 
-          const now = Date.now();
-          if (command.position !== undefined && command.position !== null) {
-            room.current_position = command.position;
+          const normalizedAction = normalizeSyncAction(command.action);
+          if (!normalizedAction) {
+            break;
           }
-          room.position_updated_at = now;
 
-          if (command.action === 'play') {
+          const now = Date.now();
+          const commandPosition = normalizeSyncPosition(command.position, getServerPosition(room));
+          const normalizedCommand = {
+            ...command,
+            action: normalizedAction,
+            position: commandPosition,
+          };
+
+          room.current_position = commandPosition;
+          room.position_updated_at = now;
+          room.last_sync_from = participantId;
+          room.last_sync_at = now;
+
+          if (normalizedAction === 'play') {
             room.state = 'playing';
             room.is_paused = false;
-          }
-          if (command.action === 'pause') {
+            participant.lastPaused = false;
+          } else if (normalizedAction === 'pause') {
             room.state = 'paused';
             room.is_paused = true;
+            participant.lastPaused = true;
           }
+          participant.lastPosition = commandPosition;
+          participant.lastStateReport = now;
 
           // Broadcast to ALL participants (including sender with a flag)
           // Each client uses ignoringOnTheFly to suppress echo
@@ -4264,7 +4360,7 @@ wss.on('connection', (ws, req) => {
             if (p.ws && p.ws.readyState === 1) {
               const msg = {
                 type: 'sync',
-                command,
+                command: normalizedCommand,
                 from: participantId,
                 timestamp: now,
                 is_echo: id === participantId, // Let sender know this is their own echo
@@ -4280,9 +4376,29 @@ wss.on('connection', (ws, req) => {
           // This is the Syncplay-style "State" message
           const participant = room.participants.get(participantId);
           if (participant) {
-            participant.lastPosition = message.position ?? participant.lastPosition;
-            participant.lastPaused = message.paused !== undefined ? message.paused : participant.lastPaused;
-            participant.lastStateReport = Date.now();
+            const now = Date.now();
+            const reportPosition = Number(message.position);
+            const hasPosition = Number.isFinite(reportPosition);
+            const normalizedPosition = hasPosition
+              ? normalizeSyncPosition(reportPosition, participant.lastPosition)
+              : participant.lastPosition;
+            const reportPaused = message.paused !== undefined ? !!message.paused : participant.lastPaused;
+
+            participant.lastPosition = normalizedPosition;
+            participant.lastPaused = reportPaused;
+            participant.lastStateReport = now;
+
+            if ((room.state === 'playing' || room.state === 'paused')
+              && canParticipantDriveRoomState(room, participantId, participant, now)) {
+              const serverPos = getServerPosition(room);
+              const drift = Math.abs(serverPos - normalizedPosition);
+              if (drift > STATE_REPORT_CORRECTION_THRESHOLD || room.is_paused !== reportPaused) {
+                room.current_position = normalizedPosition;
+                room.position_updated_at = now;
+                room.is_paused = reportPaused;
+                room.state = reportPaused ? 'paused' : 'playing';
+              }
+            }
           }
           break;
         }
@@ -4475,6 +4591,10 @@ function handleParticipantLeave(room, participantId) {
 
   const wasHost = participant.is_host;
   room.participants.delete(participantId);
+  if (room.last_sync_from === participantId) {
+    room.last_sync_from = null;
+    room.last_sync_at = Date.now();
+  }
 
   wtDebugLog(`[WT] ${participant.nickname} left room ${room.code}`);
 
@@ -4483,6 +4603,10 @@ function handleParticipantLeave(room, participantId) {
     const newHost = room.participants.values().next().value;
     newHost.is_host = true;
     room.host_id = newHost.id;
+    if (!room.last_sync_from) {
+      room.last_sync_from = newHost.id;
+      room.last_sync_at = Date.now();
+    }
     wtDebugLog(`[WT] New host: ${newHost.nickname}`);
   }
 

@@ -33,6 +33,62 @@ const FRIENDS_FILE = 'friends.json';
 const ACTIVITY_FILE = 'activity.json';
 const CHAT_FOLDER = 'chats';
 
+function normalizeSocialId(value) {
+  if (typeof value !== 'string') return '';
+  return value.trim();
+}
+
+function normalizeText(value, maxLength = 500) {
+  if (typeof value !== 'string') return '';
+  return value.trim().slice(0, maxLength);
+}
+
+function syncFriendshipsForUser(googleId, friends) {
+  const userId = normalizeSocialId(googleId);
+  if (!userId) return [];
+
+  const friendIds = Array.isArray(friends)
+    ? Array.from(new Set(
+      friends
+        .map((friend) => normalizeSocialId(friend?.id))
+        .filter(Boolean)
+    ))
+    : [];
+
+  friendships.set(userId, friendIds);
+  return friendIds;
+}
+
+function addFriendshipLink(userId, friendId) {
+  const normalizedUserId = normalizeSocialId(userId);
+  const normalizedFriendId = normalizeSocialId(friendId);
+  if (!normalizedUserId || !normalizedFriendId) return;
+  const existing = friendships.get(normalizedUserId) || [];
+  if (!existing.includes(normalizedFriendId)) {
+    friendships.set(normalizedUserId, [...existing, normalizedFriendId]);
+  }
+}
+
+function removeFriendshipLink(userId, friendId) {
+  const normalizedUserId = normalizeSocialId(userId);
+  const normalizedFriendId = normalizeSocialId(friendId);
+  if (!normalizedUserId || !normalizedFriendId) return;
+  const existing = friendships.get(normalizedUserId) || [];
+  friendships.set(normalizedUserId, existing.filter((id) => id !== normalizedFriendId));
+}
+
+function touchUserSession(googleId, accessToken) {
+  const userId = normalizeSocialId(googleId);
+  const token = normalizeText(accessToken || '', 4096);
+  if (!userId || !token) return;
+
+  const cached = userProfiles.get(userId);
+  if (!cached) return;
+
+  cached.accessToken = token;
+  cached.lastSeen = Date.now();
+}
+
 /**
  * Generate username from email
  */
@@ -307,6 +363,7 @@ async function saveFileToDrive(accessToken, folderId, fileName, data) {
  */
 async function getProfile(googleId, accessToken) {
   if (userProfiles.has(googleId)) {
+    touchUserSession(googleId, accessToken);
     const cached = userProfiles.get(googleId);
     return {
       id: cached.id,
@@ -338,14 +395,56 @@ async function updateProfile(googleId, accessToken, updates) {
     throw new Error('Profile not initialized');
   }
 
+  const normalizedUpdates = {};
+  if (Object.prototype.hasOwnProperty.call(updates || {}, 'displayName')) {
+    normalizedUpdates.displayName = normalizeText(updates.displayName, 120) || cached.displayName;
+  }
+  if (Object.prototype.hasOwnProperty.call(updates || {}, 'avatarUrl')) {
+    const avatarUrl = normalizeText(updates.avatarUrl, 2048);
+    normalizedUpdates.avatarUrl = avatarUrl || null;
+  }
+  if (Object.prototype.hasOwnProperty.call(updates || {}, 'bio')) {
+    normalizedUpdates.bio = normalizeText(updates.bio, 200);
+  }
+  if (Object.prototype.hasOwnProperty.call(updates || {}, 'favoriteGenre')) {
+    normalizedUpdates.favoriteGenre = normalizeText(updates.favoriteGenre, 60);
+  }
+  if (Object.prototype.hasOwnProperty.call(updates || {}, 'location')) {
+    normalizedUpdates.location = normalizeText(updates.location, 80);
+  }
+  if (Object.prototype.hasOwnProperty.call(updates || {}, 'privacySettings')) {
+    normalizedUpdates.privacySettings = {
+      ...(cached.privacySettings || {}),
+      ...(updates.privacySettings || {})
+    };
+  }
+  if (Object.prototype.hasOwnProperty.call(updates || {}, 'stats')) {
+    normalizedUpdates.stats = {
+      ...(cached.stats || {}),
+      ...(updates.stats || {})
+    };
+  }
+
   const updatedProfile = {
     ...cached,
-    ...updates,
+    ...normalizedUpdates,
     id: googleId // Prevent ID change
   };
 
   await saveFileToDrive(accessToken, cached.folderId, PROFILE_FILE, updatedProfile);
   userProfiles.set(googleId, updatedProfile);
+
+  // Keep persistent user search metadata in sync when profile changes.
+  await database.upsertUser({
+    googleId,
+    username: updatedProfile.username,
+    displayName: updatedProfile.displayName,
+    email: updatedProfile.email,
+    avatarUrl: updatedProfile.avatarUrl,
+    allowFriendRequests: updatedProfile.privacySettings?.allowFriendRequests !== false,
+    createdAt: updatedProfile.createdAt
+  });
+
   return updatedProfile;
 }
 
@@ -370,11 +469,17 @@ async function updateStats(googleId, accessToken, statsUpdate) {
  * Friends Management
  */
 async function getFriends(googleId, accessToken) {
+  touchUserSession(googleId, accessToken);
   const cached = userProfiles.get(googleId);
-  if (!cached) return [];
+  if (!cached) {
+    friendships.set(googleId, []);
+    return [];
+  }
 
   const friendsData = await loadFileFromDrive(accessToken, cached.folderId, FRIENDS_FILE);
-  return friendsData?.friends || [];
+  const friends = Array.isArray(friendsData?.friends) ? friendsData.friends : [];
+  syncFriendshipsForUser(googleId, friends);
+  return friends;
 }
 
 async function sendFriendRequest(fromId, fromName, fromAvatar, toId, toAccessToken) {
@@ -437,27 +542,37 @@ async function acceptFriendRequest(googleId, accessToken, fromId) {
   // Remove request and add friend
   friendsData.requests.splice(requestIndex, 1);
   friendsData.friends = friendsData.friends || [];
-  friendsData.friends.push({
-    id: fromId,
-    name: request.fromName,
-    avatar: request.fromAvatar,
-    since: Date.now()
-  });
+  const alreadyFriend = friendsData.friends.some((f) => f.id === fromId);
+  if (!alreadyFriend) {
+    friendsData.friends.push({
+      id: fromId,
+      name: request.fromName,
+      avatar: request.fromAvatar,
+      since: Date.now()
+    });
+  }
 
   await saveFileToDrive(accessToken, cached.folderId, FRIENDS_FILE, friendsData);
+  syncFriendshipsForUser(googleId, friendsData.friends);
+  addFriendshipLink(googleId, fromId);
+  addFriendshipLink(fromId, googleId);
 
   // Also add to sender's friends list
   const senderProfile = userProfiles.get(fromId);
   if (senderProfile) {
     const senderFriendsData = await loadFileFromDrive(senderProfile.accessToken, senderProfile.folderId, FRIENDS_FILE) || { friends: [], requests: [] };
     senderFriendsData.friends = senderFriendsData.friends || [];
-    senderFriendsData.friends.push({
-      id: googleId,
-      name: cached.displayName,
-      avatar: cached.avatarUrl,
-      since: Date.now()
-    });
+    const senderAlreadyFriend = senderFriendsData.friends.some((f) => f.id === googleId);
+    if (!senderAlreadyFriend) {
+      senderFriendsData.friends.push({
+        id: googleId,
+        name: cached.displayName,
+        avatar: cached.avatarUrl,
+        since: Date.now()
+      });
+    }
     await saveFileToDrive(senderProfile.accessToken, senderProfile.folderId, FRIENDS_FILE, senderFriendsData);
+    syncFriendshipsForUser(fromId, senderFriendsData.friends);
 
     // Notify sender
     const senderWs = onlineUsers.get(fromId)?.ws;
@@ -491,6 +606,9 @@ async function removeFriend(googleId, accessToken, friendId) {
   const friendsData = await loadFileFromDrive(accessToken, cached.folderId, FRIENDS_FILE) || { friends: [], requests: [] };
   friendsData.friends = friendsData.friends?.filter(f => f.id !== friendId) || [];
   await saveFileToDrive(accessToken, cached.folderId, FRIENDS_FILE, friendsData);
+  syncFriendshipsForUser(googleId, friendsData.friends);
+  removeFriendshipLink(googleId, friendId);
+  removeFriendshipLink(friendId, googleId);
 
   // Also remove from friend's list
   const friendProfile = userProfiles.get(friendId);
@@ -498,6 +616,7 @@ async function removeFriend(googleId, accessToken, friendId) {
     const friendFriendsData = await loadFileFromDrive(friendProfile.accessToken, friendProfile.folderId, FRIENDS_FILE) || { friends: [], requests: [] };
     friendFriendsData.friends = friendFriendsData.friends?.filter(f => f.id !== googleId) || [];
     await saveFileToDrive(friendProfile.accessToken, friendProfile.folderId, FRIENDS_FILE, friendFriendsData);
+    syncFriendshipsForUser(friendId, friendFriendsData.friends);
   }
 
   return true;
@@ -647,19 +766,20 @@ function getCurrentlyWatching(googleId) {
   return onlineUsers.get(googleId)?.currentlyWatching || null;
 }
 
-function getFriendsCurrentlyWatching(googleId) {
-  const friends = friendships.get(googleId) || [];
+async function getFriendsCurrentlyWatching(googleId, accessToken) {
+  const friends = await getFriends(googleId, accessToken);
   const watching = [];
 
-  for (const friendId of friends) {
+  for (const friend of friends) {
+    const friendId = friend.id;
     const friendSession = onlineUsers.get(friendId);
     const friendProfile = userProfiles.get(friendId);
 
     if (friendSession?.currentlyWatching && friendProfile?.privacySettings?.showCurrentlyWatching !== false) {
       watching.push({
         userId: friendId,
-        userName: friendProfile.displayName,
-        userAvatar: friendProfile.avatarUrl,
+        userName: friend.name || friendProfile.displayName,
+        userAvatar: friend.avatar ?? friendProfile.avatarUrl,
         ...friendSession.currentlyWatching
       });
     }
@@ -715,18 +835,35 @@ async function loadChatHistory(googleId, accessToken, friendId) {
 }
 
 async function saveChatMessage(googleId, accessToken, friendId, message) {
+  touchUserSession(googleId, accessToken);
   const cached = userProfiles.get(googleId);
   if (!cached) return null;
 
+  const normalizedFriendId = normalizeSocialId(friendId);
+  if (!normalizedFriendId) {
+    throw new Error('Missing friend id');
+  }
+
+  const text = normalizeText(message?.text || '', 2000);
+  if (!text) {
+    throw new Error('Message cannot be empty');
+  }
+
+  const friends = await getFriends(googleId, accessToken);
+  const isFriend = friends.some((friend) => friend.id === normalizedFriendId);
+  if (!isFriend) {
+    throw new Error('Can only message friends');
+  }
+
   const chatFolderId = await getOrCreateChatFolder(accessToken, cached.folderId);
-  const chatId = getChatId(googleId, friendId);
+  const chatId = getChatId(googleId, normalizedFriendId);
 
   const chatData = await loadFileFromDrive(accessToken, chatFolderId, `${chatId}.json`) || { messages: [] };
 
   const newMessage = {
     id: uuidv4(),
     senderId: googleId,
-    text: message.text,
+    text,
     timestamp: Date.now()
   };
 
@@ -739,29 +876,74 @@ async function saveChatMessage(googleId, accessToken, friendId, message) {
 
   await saveFileToDrive(accessToken, chatFolderId, `${chatId}.json`, chatData);
 
-  // Also save to friend's Drive
-  const friendProfile = userProfiles.get(friendId);
-  if (friendProfile) {
-    const friendChatFolderId = await getOrCreateChatFolder(friendProfile.accessToken, friendProfile.folderId);
-    const friendChatData = await loadFileFromDrive(friendProfile.accessToken, friendChatFolderId, `${chatId}.json`) || { messages: [] };
-    friendChatData.messages.push(newMessage);
-    if (friendChatData.messages.length > 500) {
-      friendChatData.messages = friendChatData.messages.slice(-500);
+  // Also save to friend's Drive when we have a valid cached session for that user.
+  // Mirror failures should not fail the sender's write path.
+  const friendProfile = userProfiles.get(normalizedFriendId);
+  if (friendProfile?.accessToken) {
+    try {
+      const friendChatFolderId = await getOrCreateChatFolder(friendProfile.accessToken, friendProfile.folderId);
+      const friendChatData = await loadFileFromDrive(friendProfile.accessToken, friendChatFolderId, `${chatId}.json`) || { messages: [] };
+      friendChatData.messages.push(newMessage);
+      if (friendChatData.messages.length > 500) {
+        friendChatData.messages = friendChatData.messages.slice(-500);
+      }
+      await saveFileToDrive(friendProfile.accessToken, friendChatFolderId, `${chatId}.json`, friendChatData);
+    } catch (error) {
+      socialDebugLog('[Social] Failed to mirror chat to friend drive:', normalizedFriendId, error?.message || error);
     }
-    await saveFileToDrive(friendProfile.accessToken, friendChatFolderId, `${chatId}.json`, friendChatData);
   }
 
   return newMessage;
+}
+
+function emitRealtimeChatDelivery(fromId, friendId, message, options = {}) {
+  const senderProfile = userProfiles.get(fromId);
+  const friendWs = onlineUsers.get(friendId)?.ws;
+  if (friendWs && friendWs.readyState === 1) {
+    friendWs.send(JSON.stringify({
+      type: 'chat_message',
+      message: {
+        ...message,
+        senderName: senderProfile?.displayName,
+        senderAvatar: senderProfile?.avatarUrl
+      },
+      fromUserId: fromId
+    }));
+  }
+
+  const senderWs = onlineUsers.get(fromId)?.ws;
+  if (senderWs && senderWs.readyState === 1 && options.emitToSender !== false) {
+    senderWs.send(JSON.stringify({
+      type: 'chat_message_sent',
+      message,
+      friendId,
+      clientMessageId: options.clientMessageId || null,
+    }));
+  }
 }
 
 /**
  * WebSocket handlers for real-time features
  */
 function handleSocialConnection(ws, googleId, accessToken) {
+  const existingSession = onlineUsers.get(googleId);
+  if (existingSession?.ws && existingSession.ws !== ws) {
+    try {
+      existingSession.ws.close(1000, 'Session replaced');
+    } catch {
+      // Ignore close errors for stale sockets.
+    }
+  }
+
   onlineUsers.set(googleId, {
     ws,
     lastSeen: Date.now(),
     currentlyWatching: null
+  });
+
+  // Keep friendship cache fresh so presence broadcasts can route correctly.
+  getFriends(googleId, accessToken).catch((error) => {
+    socialDebugLog('[Social] Failed to hydrate friendships on connect:', error?.message || error);
   });
 
   // Notify friends that user is online
@@ -777,29 +959,20 @@ function handleSocialConnection(ws, googleId, accessToken) {
       switch (message.type) {
         case 'chat_message': {
           const { friendId, text } = message;
+          if (!friendId || typeof text !== 'string') {
+            ws.send(JSON.stringify({ type: 'error', message: 'friendId and text are required' }));
+            break;
+          }
           const savedMessage = await saveChatMessage(googleId, accessToken, friendId, { text });
-
-          // Send to friend if online
-          const friendWs = onlineUsers.get(friendId)?.ws;
-          if (friendWs && friendWs.readyState === 1) {
-            const profile = userProfiles.get(googleId);
-            friendWs.send(JSON.stringify({
-              type: 'chat_message',
-              message: {
-                ...savedMessage,
-                senderName: profile?.displayName,
-                senderAvatar: profile?.avatarUrl
-              },
-              fromUserId: googleId
-            }));
+          if (!savedMessage) {
+            ws.send(JSON.stringify({ type: 'error', message: 'Failed to save message' }));
+            break;
           }
 
-          // Confirm to sender
-          ws.send(JSON.stringify({
-            type: 'chat_message_sent',
-            message: savedMessage,
-            friendId
-          }));
+          emitRealtimeChatDelivery(googleId, friendId, savedMessage, {
+            clientMessageId: normalizeText(message.clientMessageId || '', 128) || null,
+            emitToSender: true,
+          });
           break;
         }
 
@@ -840,6 +1013,11 @@ function handleSocialConnection(ws, googleId, accessToken) {
   });
 
   ws.on('close', () => {
+    const activeSession = onlineUsers.get(googleId);
+    if (!activeSession || activeSession.ws !== ws) {
+      return;
+    }
+
     // Notify friends that user is offline
     broadcastToFriends(googleId, {
       type: 'friend_offline',
@@ -935,18 +1113,26 @@ async function getFriendProfile(googleId, accessToken, friendId) {
 /**
  * Get online friends
  */
-function getOnlineFriends(googleId) {
-  const friends = friendships.get(googleId) || [];
+async function getOnlineFriends(googleId, accessToken) {
+  const friends = await getFriends(googleId, accessToken);
   const online = [];
 
-  for (const friendId of friends) {
-    if (onlineUsers.has(friendId)) {
+  for (const friend of friends) {
+    const friendId = normalizeSocialId(friend?.id);
+    if (!friendId) continue;
+
+    const friendSession = onlineUsers.get(friendId);
+    if (friendSession) {
       const profile = userProfiles.get(friendId);
       online.push({
         id: friendId,
-        displayName: profile?.displayName,
-        avatarUrl: profile?.avatarUrl,
-        currentlyWatching: onlineUsers.get(friendId)?.currentlyWatching
+        name: friend.name || profile?.displayName || 'Friend',
+        avatar: friend.avatar ?? profile?.avatarUrl ?? null,
+        since: Number(friend?.since) || 0,
+        isOnline: true,
+        currentlyWatching: profile?.privacySettings?.showCurrentlyWatching === false
+          ? null
+          : friendSession.currentlyWatching || null
       });
     }
   }
@@ -974,10 +1160,12 @@ module.exports = {
   getFriendsCurrentlyWatching,
   loadChatHistory,
   saveChatMessage,
+  emitRealtimeChatDelivery,
   handleSocialConnection,
   searchUsers,
   getFriendProfile,
   getOnlineFriends,
+  touchUserSession,
   userProfiles,
   onlineUsers
 };

@@ -424,6 +424,109 @@ async function run() {
       );
     }
 
+    // "resume" should be accepted as a legacy alias and canonicalized to "play".
+    const resumeTarget = simPos + 2.5;
+    host.send({
+      type: 'sync',
+      command: {
+        action: 'resume',
+        position: resumeTarget,
+      },
+    });
+    const resumeSync = await guest.waitFor(
+      (m) => (
+        m.data.type === 'sync'
+        && !m.data.is_echo
+        && m.data.from === hostId
+        && m.data.command?.action === 'play'
+        && Math.abs((m.data.command?.position ?? 0) - resumeTarget) < 0.001
+      ),
+      2500,
+      'resume alias canonicalization',
+    );
+    assert.equal(resumeSync.data.command.action, 'play', 'resume alias should be broadcast as play');
+
+    // If a seek command carries a stale position, fresh state_report from the
+    // same authority should pull the room toward the true playback position.
+    const staleSeekPos = simPos + 18;
+    const correctedHostPos = staleSeekPos + 36;
+    host.send({
+      type: 'sync',
+      command: {
+        action: 'seek',
+        position: staleSeekPos,
+      },
+    });
+    await guest.waitFor(
+      (m) => (
+        m.data.type === 'sync'
+        && !m.data.is_echo
+        && m.data.from === hostId
+        && m.data.command?.action === 'seek'
+        && Math.abs((m.data.command?.position ?? 0) - staleSeekPos) < 0.001
+      ),
+      2500,
+      'stale host seek relay',
+    );
+    for (let i = 0; i < 3; i += 1) {
+      host.send({ type: 'state_report', position: correctedHostPos + (i * 0.05), paused: false });
+      await delay(70);
+    }
+    const hostCorrectionUpdate = await guest.waitFor(
+      (m) => (
+        m.data.type === 'state_update'
+        && m.data.paused === false
+        && (m.data.position ?? 0) > correctedHostPos - 0.8
+      ),
+      3500,
+      'host correction state_update',
+    );
+    assert.ok(
+      hostCorrectionUpdate.data.position > correctedHostPos - 0.8,
+      `expected corrected host position near ${correctedHostPos}, got ${hostCorrectionUpdate.data.position}`,
+    );
+
+    // Collaborative mode: the latest non-host sync source should also be able
+    // to correct authoritative room state via state_report.
+    const staleGuestSeekPos = correctedHostPos + 22;
+    const correctedGuestPos = staleGuestSeekPos + 33;
+    guest.send({
+      type: 'sync',
+      command: {
+        action: 'seek',
+        position: staleGuestSeekPos,
+      },
+    });
+    await host.waitFor(
+      (m) => (
+        m.data.type === 'sync'
+        && !m.data.is_echo
+        && m.data.from === guestId
+        && m.data.command?.action === 'seek'
+        && Math.abs((m.data.command?.position ?? 0) - staleGuestSeekPos) < 0.001
+      ),
+      2500,
+      'stale guest seek relay',
+    );
+    for (let i = 0; i < 3; i += 1) {
+      guest.send({ type: 'state_report', position: correctedGuestPos + (i * 0.05), paused: false });
+      await delay(70);
+    }
+    const guestCorrectionUpdate = await host.waitFor(
+      (m) => (
+        m.data.type === 'state_update'
+        && m.data.paused === false
+        && (m.data.position ?? 0) > correctedGuestPos - 0.8
+      ),
+      3500,
+      'guest correction state_update',
+    );
+    assert.ok(
+      guestCorrectionUpdate.data.position > correctedGuestPos - 0.8,
+      `expected corrected guest position near ${correctedGuestPos}, got ${guestCorrectionUpdate.data.position}`,
+    );
+    simPos = correctedGuestPos;
+
     const hostToGuest = await measureSyncLatency({
       sender: host,
       receiver: guest,
