@@ -15,7 +15,7 @@
     "dotenv": "^16.3.1",
     "ws": "^8.16.0",
     "uuid": "^9.0.0",
-    "@libsql/client": "^0.5.6"
+    "@libsql/client": "^0.17.0"
   },
   "engines": {
     "node": ">=18"
