@@ -1967,10 +1967,12 @@ app.get('/api/tmdb', (req, res) => {
   res.status(400).json({ error: 'Missing TMDB API path' });
 });
 
-app.get('/api/tmdb/*', async (req, res) => {
+// Express 5 requires named wildcard params (path-to-regexp v8).
+app.get('/api/tmdb/*tmdbPath', async (req, res) => {
   const requestId = createTmdbRequestId();
   const startMs = Date.now();
-  const rawPath = req.params[0];
+  const wildcardPath = req.params?.tmdbPath ?? req.params?.[0];
+  const rawPath = Array.isArray(wildcardPath) ? wildcardPath.join('/') : wildcardPath;
   const path = sanitizeTmdbPath(rawPath);
 
   if (!path) {
