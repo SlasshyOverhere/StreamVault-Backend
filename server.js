@@ -10,9 +10,7 @@ const social = require('./social');
 const database = require('./database');
 
 const app = express();
-app.use(cors());
-app.use(express.json());
-app.use(express.urlencoded({ extended: false }));
+app.disable('x-powered-by');
 
 const PORT = process.env.PORT || 3001;
 
@@ -59,6 +57,7 @@ const parsePositiveFloat = (rawValue, fallback) => {
   const parsed = Number(rawValue);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 };
+const CORS_ALLOWED_ORIGINS = new Set(splitEnvList(process.env.CORS_ALLOWED_ORIGINS).map((origin) => origin.trim()).filter(Boolean));
 const RUNTIME_METRICS_USERNAME = (process.env.RUNTIME_METRICS_USERNAME || 'runtime').trim();
 const RUNTIME_METRICS_PASSWORD = (process.env.RUNTIME_METRICS_PASSWORD || '').trim();
 const RUNTIME_RATE_WINDOW_MS = parsePositiveInt(process.env.RUNTIME_RATE_WINDOW_MS, 10 * 60 * 1000);
@@ -128,6 +127,26 @@ const AI_IMDB_FETCH_TIMEOUT_MS = parsePositiveInt(
 const AI_USD_TO_INR_RATE = parsePositiveFloat(process.env.AI_USD_TO_INR_RATE, 83);
 const AI_IST_TIMEZONE = 'Asia/Kolkata';
 const WT_LIVE_LOGS_ENABLED = process.env.WT_LIVE_LOGS === '1';
+
+function isCorsOriginAllowed(origin) {
+  if (!origin) return true; // Native clients and curl usually have no Origin.
+  if (CORS_ALLOWED_ORIGINS.size === 0) return true;
+  return CORS_ALLOWED_ORIGINS.has(origin);
+}
+
+app.use(cors({
+  origin(origin, callback) {
+    callback(null, isCorsOriginAllowed(origin));
+  },
+}));
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  next();
+});
+app.use(express.json({ limit: '1mb' }));
+app.use(express.urlencoded({ extended: false, limit: '1mb' }));
 
 const runtimeRateByIp = new Map();
 const runtimeAuthByIp = new Map();
@@ -3860,7 +3879,10 @@ app.get('/auth/callback', async (req, res) => {
     const tokens = await tokenResponse.json();
 
     if (tokens.error) {
-      console.error('Token error:', tokens);
+      console.error('Token error from Google OAuth:', {
+        error: tokens.error,
+        error_description: tokens.error_description,
+      });
       return res.redirect(`http://localhost:8085/callback?error=${encodeURIComponent(tokens.error_description || tokens.error)}`);
     }
 
