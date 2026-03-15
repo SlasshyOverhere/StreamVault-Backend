@@ -100,6 +100,50 @@ function generateUsernameFromEmail(email) {
   return username || `user_${Date.now()}`;
 }
 
+function createDefaultPrivacySettings(existing = {}) {
+  return {
+    showStatsToFriends: true,
+    showActivityToFriends: true,
+    showCurrentlyWatching: true,
+    allowFriendRequests: true,
+    showEmail: false,
+    showLocation: false,
+    ...(existing || {})
+  };
+}
+
+function createDefaultStats(existing = {}) {
+  return {
+    totalWatchTime: 0,
+    moviesWatched: 0,
+    tvEpisodesWatched: 0,
+    favoriteGenres: [],
+    lastUpdated: Date.now(),
+    ...(existing || {})
+  };
+}
+
+function createSocialProfile(googleId, userInfo = {}, existing = {}) {
+  const email = existing.email || userInfo.email || '';
+  const username = existing.username || generateUsernameFromEmail(email);
+  const createdAt = Number(existing.createdAt) || Date.now();
+
+  return {
+    id: googleId,
+    username,
+    displayName: existing.displayName || userInfo.name || username,
+    email,
+    avatarUrl: existing.avatarUrl || userInfo.picture || null,
+    bio: existing.bio || '',
+    favoriteGenre: existing.favoriteGenre || '',
+    location: existing.location || '',
+    joinedAt: Number(existing.joinedAt) || createdAt,
+    createdAt,
+    privacySettings: createDefaultPrivacySettings(existing.privacySettings),
+    stats: createDefaultStats(existing.stats)
+  };
+}
+
 /**
  * Initialize social features for a user
  */
@@ -108,50 +152,38 @@ async function initUserSocial(googleId, accessToken, userInfo) {
   socialDebugLog('[Social] userInfo:', JSON.stringify(userInfo, null, 2));
 
   try {
-    // Check if social folder exists in Drive
-    socialDebugLog('[Social] Getting or creating social folder...');
+    // Drive is optional now. Social auth may only have identity scopes.
+    socialDebugLog('[Social] Getting or creating social folder when Drive scope is available...');
     const folderId = await getOrCreateSocialFolder(accessToken);
     socialDebugLog('[Social] Folder ID:', folderId);
 
     // Load or create profile
     socialDebugLog('[Social] Loading profile...');
     let profile = await loadFileFromDrive(accessToken, folderId, PROFILE_FILE);
+    if (!profile && database.isConnected()) {
+      const storedProfile = await database.getUser(googleId);
+      if (storedProfile) {
+        profile = createSocialProfile(googleId, userInfo, {
+          username: storedProfile.username,
+          displayName: storedProfile.displayName,
+          email: storedProfile.email,
+          avatarUrl: storedProfile.avatarUrl,
+          bio: storedProfile.bio,
+          location: storedProfile.location,
+          createdAt: storedProfile.createdAt,
+          privacySettings: {
+            allowFriendRequests: storedProfile.allowFriendRequests
+          }
+        });
+      }
+    }
     socialDebugLog('[Social] Existing profile:', profile ? JSON.stringify(profile, null, 2) : 'not found');
 
     let needsSave = false;
 
     if (!profile) {
       socialDebugLog('[Social] Creating new profile...');
-      // Generate username from email (remove @gmail.com, @domain.com, etc.)
-      const username = generateUsernameFromEmail(userInfo.email);
-
-      profile = {
-        id: googleId,
-        username: username,
-        displayName: userInfo.name || username,
-        email: userInfo.email,
-        avatarUrl: userInfo.picture || null,
-        bio: '',
-        favoriteGenre: '',
-        location: '',
-        joinedAt: Date.now(),
-        createdAt: Date.now(),
-        privacySettings: {
-          showStatsToFriends: true,
-          showActivityToFriends: true,
-          showCurrentlyWatching: true,
-          allowFriendRequests: true,
-          showEmail: false,
-          showLocation: false
-        },
-        stats: {
-          totalWatchTime: 0,
-          moviesWatched: 0,
-          tvEpisodesWatched: 0,
-          favoriteGenres: [],
-          lastUpdated: Date.now()
-        }
-      };
+      profile = createSocialProfile(googleId, userInfo);
       needsSave = true;
     } else {
       // Migration: Update email from userInfo if missing
@@ -193,12 +225,14 @@ async function initUserSocial(googleId, accessToken, userInfo) {
         profile.joinedAt = profile.createdAt || Date.now();
         needsSave = true;
       }
+      profile.privacySettings = createDefaultPrivacySettings(profile.privacySettings);
+      profile.stats = createDefaultStats(profile.stats);
     }
 
     socialDebugLog('[Social] Profile after migration:', JSON.stringify(profile, null, 2));
     socialDebugLog('[Social] Needs save:', needsSave);
 
-    if (needsSave) {
+    if (needsSave && folderId) {
       const saved = await saveFileToDrive(accessToken, folderId, PROFILE_FILE, profile);
       socialDebugLog('[Social] Profile save result:', saved);
     }
@@ -229,6 +263,10 @@ async function initUserSocial(googleId, accessToken, userInfo) {
  */
 async function getOrCreateSocialFolder(accessToken) {
   try {
+    if (!accessToken) {
+      return null;
+    }
+
     const searchUrl = `https://www.googleapis.com/drive/v3/files?q=name='${SOCIAL_FOLDER}' and mimeType='application/vnd.google-apps.folder' and trashed=false&fields=files(id,name)`;
 
     socialDebugLog('[Social] Searching for folder...');
@@ -238,6 +276,10 @@ async function getOrCreateSocialFolder(accessToken) {
 
     if (!searchRes.ok) {
       const errorText = await searchRes.text();
+      if (searchRes.status === 403) {
+        socialDebugLog('[Social] Folder search skipped because Drive scope is unavailable:', errorText);
+        return null;
+      }
       console.error('[Social] Folder search failed:', searchRes.status, errorText);
       throw new Error(`Drive API error: ${searchRes.status}`);
     }
@@ -266,6 +308,10 @@ async function getOrCreateSocialFolder(accessToken) {
 
     if (!createRes.ok) {
       const errorText = await createRes.text();
+      if (createRes.status === 403) {
+        socialDebugLog('[Social] Folder creation skipped because Drive scope is unavailable:', errorText);
+        return null;
+      }
       console.error('[Social] Folder creation failed:', createRes.status, errorText);
       throw new Error(`Drive API error: ${createRes.status}`);
     }
@@ -281,10 +327,17 @@ async function getOrCreateSocialFolder(accessToken) {
 
 async function loadFileFromDrive(accessToken, folderId, fileName) {
   try {
+    if (!accessToken || !folderId || !fileName) {
+      return null;
+    }
+
     const searchUrl = `https://www.googleapis.com/drive/v3/files?q=name='${fileName}' and '${folderId}' in parents and trashed=false&fields=files(id)`;
     const searchRes = await fetch(searchUrl, {
       headers: { 'Authorization': `Bearer ${accessToken}` }
     });
+    if (!searchRes.ok) {
+      return null;
+    }
     const searchData = await searchRes.json();
 
     if (!searchData.files || searchData.files.length === 0) {
@@ -295,6 +348,9 @@ async function loadFileFromDrive(accessToken, folderId, fileName) {
     const contentRes = await fetch(`https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`, {
       headers: { 'Authorization': `Bearer ${accessToken}` }
     });
+    if (!contentRes.ok) {
+      return null;
+    }
     return await contentRes.json();
   } catch (error) {
     console.error('[Social] Load file error:', error);
@@ -304,11 +360,18 @@ async function loadFileFromDrive(accessToken, folderId, fileName) {
 
 async function saveFileToDrive(accessToken, folderId, fileName, data) {
   try {
+    if (!accessToken || !folderId || !fileName) {
+      return false;
+    }
+
     // Check if file exists
     const searchUrl = `https://www.googleapis.com/drive/v3/files?q=name='${fileName}' and '${folderId}' in parents and trashed=false&fields=files(id)`;
     const searchRes = await fetch(searchUrl, {
       headers: { 'Authorization': `Bearer ${accessToken}` }
     });
+    if (!searchRes.ok) {
+      return false;
+    }
     const searchData = await searchRes.json();
 
     const content = JSON.stringify(data, null, 2);
@@ -385,8 +448,30 @@ async function getProfile(googleId, accessToken) {
   const profile = await loadFileFromDrive(accessToken, folderId, PROFILE_FILE);
   if (profile) {
     userProfiles.set(googleId, { ...profile, folderId, accessToken });
+    return profile;
   }
-  return profile;
+
+  if (database.isConnected()) {
+    const storedProfile = await database.getUser(googleId);
+    if (storedProfile) {
+      const hydratedProfile = createSocialProfile(googleId, {}, {
+        username: storedProfile.username,
+        displayName: storedProfile.displayName,
+        email: storedProfile.email,
+        avatarUrl: storedProfile.avatarUrl,
+        bio: storedProfile.bio,
+        location: storedProfile.location,
+        createdAt: storedProfile.createdAt,
+        privacySettings: {
+          allowFriendRequests: storedProfile.allowFriendRequests
+        }
+      });
+      userProfiles.set(googleId, { ...hydratedProfile, folderId, accessToken });
+      return hydratedProfile;
+    }
+  }
+
+  return null;
 }
 
 async function updateProfile(googleId, accessToken, updates) {
@@ -441,6 +526,8 @@ async function updateProfile(googleId, accessToken, updates) {
     displayName: updatedProfile.displayName,
     email: updatedProfile.email,
     avatarUrl: updatedProfile.avatarUrl,
+    bio: updatedProfile.bio,
+    location: updatedProfile.location,
     allowFriendRequests: updatedProfile.privacySettings?.allowFriendRequests !== false,
     createdAt: updatedProfile.createdAt
   });
@@ -462,7 +549,20 @@ async function updateStats(googleId, accessToken, statsUpdate) {
     lastUpdated: Date.now()
   };
 
-  return updateProfile(googleId, accessToken, { stats });
+  const updatedProfile = await updateProfile(googleId, accessToken, { stats });
+
+  if (database.isConnected()) {
+    await database.updateWatchStats({
+      userId: googleId,
+      moviesWatched: updatedProfile?.stats?.moviesWatched || 0,
+      episodesWatched: updatedProfile?.stats?.tvEpisodesWatched || 0,
+      totalWatchTime: updatedProfile?.stats?.totalWatchTime || 0,
+      favoriteGenres: updatedProfile?.stats?.favoriteGenres || [],
+      updatedAt: updatedProfile?.stats?.lastUpdated || Date.now()
+    });
+  }
+
+  return updatedProfile;
 }
 
 /**
@@ -476,9 +576,26 @@ async function getFriends(googleId, accessToken) {
     return [];
   }
 
+  if (database.isConnected()) {
+    const tursoFriends = await database.getFriends(googleId);
+    if (tursoFriends.length > 0) {
+      syncFriendshipsForUser(googleId, tursoFriends);
+      return tursoFriends;
+    }
+  }
+
   const friendsData = await loadFileFromDrive(accessToken, cached.folderId, FRIENDS_FILE);
   const friends = Array.isArray(friendsData?.friends) ? friendsData.friends : [];
   syncFriendshipsForUser(googleId, friends);
+
+  if (database.isConnected() && friends.length > 0) {
+    for (const friend of friends) {
+      const friendId = normalizeSocialId(friend?.id);
+      if (!friendId) continue;
+      await database.addFriendship(googleId, friendId, Number(friend?.since) || Date.now());
+    }
+  }
+
   return friends;
 }
 
@@ -492,10 +609,19 @@ async function sendFriendRequest(fromId, fromName, fromAvatar, toId, toAccessTok
     throw new Error('User does not accept friend requests');
   }
 
-  // Load target user's friends file
+  if (database.isConnected()) {
+    if (await database.isFriend(fromId, toId)) {
+      throw new Error('Already friends');
+    }
+    const existingRequest = await database.getFriendRequestBetween(fromId, toId);
+    if (existingRequest?.status === 'pending') {
+      throw new Error('Request already pending');
+    }
+  }
+
+  // Load target user's friends file when a Drive mirror is available.
   const friendsData = await loadFileFromDrive(toAccessToken, toProfile.folderId, FRIENDS_FILE) || { friends: [], requests: [] };
 
-  // Check if already friends or request pending
   if (friendsData.friends?.some(f => f.id === fromId)) {
     throw new Error('Already friends');
   }
@@ -514,6 +640,10 @@ async function sendFriendRequest(fromId, fromName, fromAvatar, toId, toAccessTok
 
   await saveFileToDrive(toAccessToken, toProfile.folderId, FRIENDS_FILE, friendsData);
 
+  if (database.isConnected()) {
+    await database.createFriendRequest(fromId, toId);
+  }
+
   // Notify via WebSocket if online
   const targetWs = onlineUsers.get(toId)?.ws;
   if (targetWs && targetWs.readyState === 1) {
@@ -531,16 +661,33 @@ async function acceptFriendRequest(googleId, accessToken, fromId) {
   if (!cached) throw new Error('Profile not initialized');
 
   const friendsData = await loadFileFromDrive(accessToken, cached.folderId, FRIENDS_FILE) || { friends: [], requests: [] };
+  let requestIndex = friendsData.requests?.findIndex(r => r.fromId === fromId);
+  let request = requestIndex !== -1 && requestIndex !== undefined
+    ? friendsData.requests[requestIndex]
+    : null;
 
-  const requestIndex = friendsData.requests?.findIndex(r => r.fromId === fromId);
-  if (requestIndex === -1 || requestIndex === undefined) {
+  if (!request && database.isConnected()) {
+    const requestRecord = await database.getFriendRequestBetween(fromId, googleId);
+    if (requestRecord?.status === 'pending') {
+      const senderProfile = userProfiles.get(fromId);
+      const storedSender = !senderProfile ? await database.getUser(fromId) : null;
+      request = {
+        fromId,
+        fromName: senderProfile?.displayName || storedSender?.displayName || 'Friend',
+        fromAvatar: senderProfile?.avatarUrl || storedSender?.avatarUrl || null,
+        sentAt: requestRecord.createdAt
+      };
+    }
+  }
+
+  if (!request) {
     throw new Error('Request not found');
   }
 
-  const request = friendsData.requests[requestIndex];
-
   // Remove request and add friend
-  friendsData.requests.splice(requestIndex, 1);
+  if (requestIndex !== -1 && requestIndex !== undefined) {
+    friendsData.requests.splice(requestIndex, 1);
+  }
   friendsData.friends = friendsData.friends || [];
   const alreadyFriend = friendsData.friends.some((f) => f.id === fromId);
   if (!alreadyFriend) {
@@ -556,6 +703,14 @@ async function acceptFriendRequest(googleId, accessToken, fromId) {
   syncFriendshipsForUser(googleId, friendsData.friends);
   addFriendshipLink(googleId, fromId);
   addFriendshipLink(fromId, googleId);
+
+  if (database.isConnected()) {
+    await database.addFriendship(googleId, fromId, Date.now());
+    const requestRecord = await database.getFriendRequestBetween(fromId, googleId);
+    if (requestRecord) {
+      await database.updateFriendRequestStatus(requestRecord.id, 'accepted');
+    }
+  }
 
   // Also add to sender's friends list
   const senderProfile = userProfiles.get(fromId);
@@ -596,6 +751,13 @@ async function rejectFriendRequest(googleId, accessToken, fromId) {
   friendsData.requests = friendsData.requests?.filter(r => r.fromId !== fromId) || [];
   await saveFileToDrive(accessToken, cached.folderId, FRIENDS_FILE, friendsData);
 
+  if (database.isConnected()) {
+    const requestRecord = await database.getFriendRequestBetween(fromId, googleId);
+    if (requestRecord) {
+      await database.updateFriendRequestStatus(requestRecord.id, 'rejected');
+    }
+  }
+
   return true;
 }
 
@@ -609,6 +771,10 @@ async function removeFriend(googleId, accessToken, friendId) {
   syncFriendshipsForUser(googleId, friendsData.friends);
   removeFriendshipLink(googleId, friendId);
   removeFriendshipLink(friendId, googleId);
+
+  if (database.isConnected()) {
+    await database.removeFriendship(googleId, friendId);
+  }
 
   // Also remove from friend's list
   const friendProfile = userProfiles.get(friendId);
@@ -626,8 +792,27 @@ async function getPendingRequests(googleId, accessToken) {
   const cached = userProfiles.get(googleId);
   if (!cached) return [];
 
+  if (database.isConnected()) {
+    const pending = await database.getPendingRequests(googleId);
+    if (pending.length > 0) {
+      return pending;
+    }
+  }
+
   const friendsData = await loadFileFromDrive(accessToken, cached.folderId, FRIENDS_FILE);
-  return friendsData?.requests || [];
+  const requests = friendsData?.requests || [];
+
+  if (database.isConnected() && requests.length > 0) {
+    for (const request of requests) {
+      const fromId = normalizeSocialId(request?.fromId);
+      if (!fromId) continue;
+      await database.createFriendRequest(fromId, googleId, {
+        createdAt: Number(request?.sentAt) || Date.now()
+      });
+    }
+  }
+
+  return requests;
 }
 
 /**
@@ -637,20 +822,25 @@ async function logActivity(googleId, accessToken, activity) {
   const cached = userProfiles.get(googleId);
   if (!cached) return null;
 
-  const activityData = await loadFileFromDrive(accessToken, cached.folderId, ACTIVITY_FILE) || { activities: [] };
-
   const newActivity = {
     id: uuidv4(),
     ...activity,
     timestamp: Date.now()
   };
 
-  // Keep last 100 activities
+  if (database.isConnected()) {
+    await database.logActivity({
+      ...newActivity,
+      userId: googleId,
+      createdAt: newActivity.timestamp
+    });
+  }
+
+  const activityData = await loadFileFromDrive(accessToken, cached.folderId, ACTIVITY_FILE) || { activities: [] };
   activityData.activities.unshift(newActivity);
   if (activityData.activities.length > 100) {
     activityData.activities = activityData.activities.slice(0, 100);
   }
-
   await saveFileToDrive(accessToken, cached.folderId, ACTIVITY_FILE, activityData);
 
   // Update stats based on activity type
@@ -687,22 +877,60 @@ async function getActivity(googleId, accessToken) {
   const cached = userProfiles.get(googleId);
   if (!cached) return [];
 
+  if (database.isConnected()) {
+    const tursoActivities = await database.getUserActivities(googleId, 100);
+    if (tursoActivities.length > 0) {
+      return tursoActivities;
+    }
+  }
+
   const activityData = await loadFileFromDrive(accessToken, cached.folderId, ACTIVITY_FILE);
-  return activityData?.activities || [];
+  const activities = activityData?.activities || [];
+
+  if (database.isConnected() && activities.length > 0) {
+    for (const driveActivity of activities) {
+      await database.logActivity({
+        ...driveActivity,
+        userId: googleId,
+        createdAt: driveActivity.timestamp
+      });
+    }
+  }
+
+  return activities;
 }
 
 async function getFriendsActivity(googleId, accessToken, filters = {}) {
   const friends = await getFriends(googleId, accessToken);
-
-  // Load all friends' activities in parallel instead of sequentially
   const eligibleFriends = friends.filter(friend => {
     const friendProfile = userProfiles.get(friend.id);
-    return friendProfile && friendProfile.privacySettings?.showActivityToFriends !== false;
+    return !friendProfile || friendProfile.privacySettings?.showActivityToFriends !== false;
   });
+  const friendIds = eligibleFriends.map((friend) => friend.id);
 
+  const page = Math.max(Number(filters.page) || 1, 1);
+  const pageSize = Math.min(Math.max(Number(filters.pageSize) || 50, 1), 100);
+
+  if (database.isConnected() && friendIds.length > 0) {
+    const activities = await database.getFriendsActivity(googleId, friendIds, filters, page, pageSize);
+    const totalCount = await database.getFriendsActivityCount(googleId, friendIds, filters);
+
+    if (activities.length > 0 || totalCount === 0) {
+      return {
+        activities,
+        page,
+        pageSize,
+        totalCount,
+        hasMore: (page * pageSize) < totalCount
+      };
+    }
+  }
+
+  // Load all friends' activities in parallel instead of sequentially
   const activityResults = await Promise.allSettled(
     eligibleFriends.map(async (friend) => {
       const friendProfile = userProfiles.get(friend.id);
+      if (!friendProfile) return [];
       const friendActivity = await loadFileFromDrive(friendProfile.accessToken, friendProfile.folderId, ACTIVITY_FILE);
       if (friendActivity?.activities) {
         return friendActivity.activities.map(a => ({
@@ -739,7 +967,16 @@ async function getFriendsActivity(googleId, accessToken, filters = {}) {
     filtered = filtered.filter(a => a.userId === filters.userId);
   }
 
-  return filtered.slice(0, 50);
+  const offset = (page - 1) * pageSize;
+  const activities = filtered.slice(offset, offset + pageSize);
+
+  return {
+    activities,
+    page,
+    pageSize,
+    totalCount: filtered.length,
+    hasMore: offset + activities.length < filtered.length
+  };
 }
 
 /**
@@ -796,11 +1033,18 @@ function getChatId(userId1, userId2) {
 }
 
 async function getOrCreateChatFolder(accessToken, folderId) {
+  if (!accessToken || !folderId) {
+    return null;
+  }
+
   const searchUrl = `https://www.googleapis.com/drive/v3/files?q=name='${CHAT_FOLDER}' and '${folderId}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false&fields=files(id)`;
 
   const searchRes = await fetch(searchUrl, {
     headers: { 'Authorization': `Bearer ${accessToken}` }
   });
+  if (!searchRes.ok) {
+    return null;
+  }
   const searchData = await searchRes.json();
 
   if (searchData.files && searchData.files.length > 0) {
@@ -819,6 +1063,9 @@ async function getOrCreateChatFolder(accessToken, folderId) {
       mimeType: 'application/vnd.google-apps.folder'
     })
   });
+  if (!createRes.ok) {
+    return null;
+  }
   const folder = await createRes.json();
   return folder.id;
 }
@@ -827,11 +1074,41 @@ async function loadChatHistory(googleId, accessToken, friendId) {
   const cached = userProfiles.get(googleId);
   if (!cached) return [];
 
+  const normalizedFriendId = normalizeSocialId(friendId);
+  if (!normalizedFriendId) return [];
+
+  if (database.isConnected()) {
+    const tursoHistory = await database.getChatHistory(googleId, normalizedFriendId, { limit: 500, order: 'asc' });
+    if (tursoHistory.length > 0) {
+      return tursoHistory.map((message) => ({
+        id: message.id,
+        senderId: message.senderId,
+        text: message.text,
+        timestamp: message.timestamp
+      }));
+    }
+  }
+
   const chatFolderId = await getOrCreateChatFolder(accessToken, cached.folderId);
-  const chatId = getChatId(googleId, friendId);
+  const chatId = getChatId(googleId, normalizedFriendId);
   const chatData = await loadFileFromDrive(accessToken, chatFolderId, `${chatId}.json`);
 
-  return chatData?.messages || [];
+  const driveMessages = chatData?.messages || [];
+
+  if (database.isConnected() && driveMessages.length > 0) {
+    for (const driveMessage of driveMessages) {
+      await database.saveMessage({
+        id: driveMessage.id,
+        senderId: driveMessage.senderId,
+        receiverId: driveMessage.senderId === googleId ? normalizedFriendId : googleId,
+        text: driveMessage.text,
+        read: true,
+        createdAt: driveMessage.timestamp
+      });
+    }
+  }
+
+  return driveMessages;
 }
 
 async function saveChatMessage(googleId, accessToken, friendId, message) {
@@ -867,6 +1144,27 @@ async function saveChatMessage(googleId, accessToken, friendId, message) {
     timestamp: Date.now()
   };
 
+  if (database.isConnected()) {
+    await database.saveMessage({
+      id: newMessage.id,
+      senderId: googleId,
+      receiverId: normalizedFriendId,
+      text: newMessage.text,
+      read: false,
+      createdAt: newMessage.timestamp
+    });
+
+    const receiverSession = onlineUsers.get(normalizedFriendId);
+    if (!receiverSession?.ws) {
+      await database.queueMessageForDelivery({
+        id: `queue_${newMessage.id}`,
+        receiverId: normalizedFriendId,
+        messageId: newMessage.id,
+        createdAt: newMessage.timestamp
+      });
+    }
+  }
+
   chatData.messages.push(newMessage);
 
   // Keep last 500 messages
@@ -894,6 +1192,41 @@ async function saveChatMessage(googleId, accessToken, friendId, message) {
   }
 
   return newMessage;
+}
+
+async function markChatMessagesAsRead(googleId, friendId) {
+  if (!database.isConnected()) return 0;
+  return database.markMessagesAsRead(friendId, googleId);
+}
+
+async function deliverPendingMessages(googleId) {
+  if (!database.isConnected()) return [];
+
+  const pendingMessages = await database.getPendingMessages(googleId);
+  if (!pendingMessages.length) return [];
+
+  const userSession = onlineUsers.get(googleId);
+  if (!userSession?.ws || userSession.ws.readyState !== 1) {
+    return [];
+  }
+
+  const delivered = [];
+  for (const pending of pendingMessages) {
+    userSession.ws.send(JSON.stringify({
+      type: 'chat_message',
+      message: {
+        id: pending.message.id,
+        senderId: pending.message.senderId,
+        text: pending.message.text,
+        timestamp: pending.message.timestamp
+      },
+      fromUserId: pending.message.senderId
+    }));
+    await database.markQueuedMessageDelivered(pending.queueId);
+    delivered.push(pending.message);
+  }
+
+  return delivered;
 }
 
 function emitRealtimeChatDelivery(fromId, friendId, message, options = {}) {
@@ -945,6 +1278,15 @@ function handleSocialConnection(ws, googleId, accessToken) {
   getFriends(googleId, accessToken).catch((error) => {
     socialDebugLog('[Social] Failed to hydrate friendships on connect:', error?.message || error);
   });
+
+  if (database.isConnected()) {
+    database.updateLastSeen(googleId).catch((error) => {
+      socialDebugLog('[Social] Failed to update last seen on connect:', error?.message || error);
+    });
+    deliverPendingMessages(googleId).catch((error) => {
+      socialDebugLog('[Social] Failed to deliver pending messages:', error?.message || error);
+    });
+  }
 
   // Notify friends that user is online
   broadcastToFriends(googleId, {
@@ -1002,6 +1344,9 @@ function handleSocialConnection(ws, googleId, accessToken) {
           const session = onlineUsers.get(googleId);
           if (session) {
             session.lastSeen = Date.now();
+          }
+          if (database.isConnected()) {
+            database.updateLastSeen(googleId).catch(() => {});
           }
           ws.send(JSON.stringify({ type: 'heartbeat_ack' }));
           break;
@@ -1090,19 +1435,22 @@ async function getFriendProfile(googleId, accessToken, friendId) {
   const isFriend = friends.some(f => f.id === friendId);
 
   const friendProfile = userProfiles.get(friendId);
-  if (!friendProfile) return null;
+  const storedProfile = !friendProfile && database.isConnected()
+    ? await database.getUser(friendId)
+    : null;
+  if (!friendProfile && !storedProfile) return null;
 
   const profile = {
     id: friendId,
-    displayName: friendProfile.displayName,
-    avatarUrl: friendProfile.avatarUrl
+    displayName: friendProfile?.displayName || storedProfile?.displayName,
+    avatarUrl: friendProfile?.avatarUrl || storedProfile?.avatarUrl || null
   };
 
   if (isFriend) {
-    if (friendProfile.privacySettings?.showStatsToFriends !== false) {
+    if (friendProfile?.privacySettings?.showStatsToFriends !== false) {
       profile.stats = friendProfile.stats;
     }
-    if (friendProfile.privacySettings?.showCurrentlyWatching !== false) {
+    if (friendProfile?.privacySettings?.showCurrentlyWatching !== false) {
       profile.currentlyWatching = getCurrentlyWatching(friendId);
     }
   }
@@ -1160,12 +1508,16 @@ module.exports = {
   getFriendsCurrentlyWatching,
   loadChatHistory,
   saveChatMessage,
+  markChatMessagesAsRead,
+  deliverPendingMessages,
   emitRealtimeChatDelivery,
   handleSocialConnection,
   searchUsers,
   getFriendProfile,
   getOnlineFriends,
   touchUserSession,
+  loadFileFromDrive,
+  getChatId,
   userProfiles,
   onlineUsers
 };

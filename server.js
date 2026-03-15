@@ -8,6 +8,7 @@ require('dotenv').config();
 
 const social = require('./social');
 const database = require('./database');
+const redis = require('./redis');
 
 const app = express();
 app.disable('x-powered-by');
@@ -29,10 +30,17 @@ const getRedirectUri = (req) => {
   return `${protocol}://${host}/auth/callback`;
 };
 
-// Scopes for Google Drive
-const SCOPES = [
+// Scopes for Google Drive-backed features
+const DRIVE_SCOPES = [
   'https://www.googleapis.com/auth/drive',
   'https://www.googleapis.com/auth/userinfo.email'
+].join(' ');
+
+// Narrower scopes for Social auth only
+const SOCIAL_SCOPES = [
+  'openid',
+  'https://www.googleapis.com/auth/userinfo.email',
+  'https://www.googleapis.com/auth/userinfo.profile'
 ].join(' ');
 
 // ============================================
@@ -1880,8 +1888,207 @@ function canParticipantDriveRoomState(room, participantId, participant, now) {
   return participant.is_host;
 }
 
+function serializeRoomParticipant(participant) {
+  if (!participant) return null;
+
+  return {
+    id: participant.id,
+    nickname: participant.nickname,
+    is_host: !!participant.is_host,
+    is_ready: !!participant.is_ready,
+    joined_at: Number(participant.joined_at) || Date.now(),
+    media_id: participant.media_id ?? null,
+    duration: participant.duration ?? null,
+    rtt: Number(participant.rtt) || 0,
+    rttAvg: Number(participant.rttAvg) || 0,
+    lastPosition: Number(participant.lastPosition) || 0,
+    lastPaused: participant.lastPaused !== false,
+    lastStateReport: Number(participant.lastStateReport) || Date.now(),
+    disconnected_at: participant.disconnected_at ?? null
+  };
+}
+
+function buildPersistedRoomState(room) {
+  if (!room) return null;
+
+  return {
+    code: room.code,
+    media_id: room.media_id,
+    media_title: room.media_title,
+    media_match_key: room.media_match_key || '',
+    host_id: room.host_id,
+    state: room.state,
+    current_position: getServerPosition(room),
+    is_paused: !!room.is_paused,
+    position_updated_at: Date.now(),
+    sync_mode: room.sync_mode || WT_SYNC_MODE,
+    participants: Array.from(room.participants.values())
+      .map(serializeRoomParticipant)
+      .filter(Boolean),
+    created_at: Number(room.created_at) || Date.now(),
+    lastActivity: Number(room.lastActivity) || Date.now(),
+    last_sync_from: room.last_sync_from || null,
+    last_sync_at: Number(room.last_sync_at) || Date.now()
+  };
+}
+
+function hydrateRecoveredParticipant(participantData) {
+  const now = Date.now();
+
+  return {
+    id: participantData.id,
+    nickname: participantData.nickname,
+    is_host: !!participantData.is_host,
+    is_ready: !!participantData.is_ready,
+    joined_at: Number(participantData.joined_at) || now,
+    media_id: participantData.media_id ?? null,
+    duration: participantData.duration ?? null,
+    ws: null,
+    rtt: Number(participantData.rtt) || 0,
+    rttAvg: Number(participantData.rttAvg) || 0,
+    lastPosition: Number(participantData.lastPosition) || 0,
+    lastPaused: participantData.lastPaused !== false,
+    lastStateReport: Number(participantData.lastStateReport) || now,
+    disconnectTimer: null,
+    disconnected_at: participantData.disconnected_at ?? null
+  };
+}
+
+function hydrateRecoveredRoom(roomData) {
+  const participants = new Map();
+  for (const participantData of roomData.participants || []) {
+    if (!participantData?.id) continue;
+    participants.set(participantData.id, hydrateRecoveredParticipant(participantData));
+  }
+
+  const room = {
+    code: roomData.code,
+    media_id: roomData.media_id,
+    media_title: roomData.media_title,
+    media_match_key: normalizeMediaMatchKey(roomData.media_match_key),
+    host_id: roomData.host_id,
+    state: roomData.state || 'waiting',
+    current_position: normalizeSyncPosition(roomData.current_position, 0),
+    is_paused: roomData.is_paused !== false,
+    position_updated_at: Number(roomData.position_updated_at) || Date.now(),
+    sync_mode: ['host_only', 'collaborative'].includes(roomData.sync_mode) ? roomData.sync_mode : WT_SYNC_MODE,
+    participants,
+    created_at: Number(roomData.created_at) || Date.now(),
+    lastActivity: Number(roomData.lastActivity) || Date.now(),
+    last_sync_from: roomData.last_sync_from || roomData.host_id || null,
+    last_sync_at: Number(roomData.last_sync_at) || Date.now(),
+    syncInterval: null,
+    pingInterval: null
+  };
+
+  return room;
+}
+
+async function persistRoomState(room) {
+  if (!redis.isConnected() || !room) return false;
+  return redis.saveRoomState(room.code, buildPersistedRoomState(room));
+}
+
+async function syncRoomParticipantsInRedis(room) {
+  if (!redis.isConnected() || !room) return false;
+
+  const participants = Array.from(room.participants.values())
+    .map(serializeRoomParticipant)
+    .filter(Boolean);
+
+  await redis.updateRoomParticipants(room.code, participants);
+
+  await Promise.all(
+    participants.map((participant) => redis.setRoomParticipant(
+      room.code,
+      participant.id,
+      !participant.disconnected_at,
+      {
+        nickname: participant.nickname,
+        is_host: participant.is_host,
+        joined_at: participant.joined_at,
+        is_ready: participant.is_ready
+      }
+    ))
+  );
+
+  return true;
+}
+
+async function removeRoomParticipantFromRedis(roomCode, participantId) {
+  if (!redis.isConnected() || !roomCode || !participantId) return false;
+  return redis.setRoomParticipant(roomCode, participantId, false);
+}
+
+async function logRoomEvent(roomCode, event) {
+  if (!redis.isConnected() || !roomCode || !event) return false;
+  return redis.logSyncEvent(roomCode, event);
+}
+
+async function deletePersistedRoom(roomCode) {
+  if (!redis.isConnected() || !roomCode) return false;
+  return redis.deleteRoomState(roomCode);
+}
+
+async function generateUniqueRoomCode() {
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    const candidate = generateRoomCode();
+    if (rooms.has(candidate)) {
+      continue;
+    }
+
+    if (redis.isConnected()) {
+      const existingRoom = await redis.getRoomState(candidate);
+      if (existingRoom) {
+        continue;
+      }
+    }
+
+    return candidate;
+  }
+
+  throw new Error('Failed to generate a unique room code');
+}
+
+async function recoverRoomsFromRedis() {
+  if (!redis.isConnected()) {
+    console.log('[WT] Redis not connected; skipping room recovery');
+    return;
+  }
+
+  const roomCodes = await redis.listRoomCodes();
+  if (!roomCodes.length) {
+    console.log('[WT] No persisted Watch Together rooms found');
+    return;
+  }
+
+  let recoveredCount = 0;
+
+  for (const roomCode of roomCodes) {
+    try {
+      if (rooms.has(roomCode)) {
+        continue;
+      }
+
+      const roomData = await redis.getRoomState(roomCode);
+      if (!roomData) {
+        continue;
+      }
+
+      const room = hydrateRecoveredRoom(roomData);
+      rooms.set(roomCode, room);
+      startRoomSyncTimers(room);
+      recoveredCount += 1;
+    } catch (error) {
+      console.error(`[WT] Failed to recover room ${roomCode}:`, error);
+    }
+  }
+
+  console.log(`[WT] Recovered ${recoveredCount} room(s) from Redis`);
+}
+
 // Clean up inactive rooms
-setInterval(() => {
+setInterval(async () => {
   const now = Date.now();
   for (const [code, room] of rooms.entries()) {
     if (now - room.lastActivity > ROOM_TIMEOUT) {
@@ -1894,6 +2101,7 @@ setInterval(() => {
         }
       }
       rooms.delete(code);
+      await deletePersistedRoom(code);
     }
   }
 }, ROOM_CLEANUP_INTERVAL);
@@ -3638,13 +3846,39 @@ app.get('/api/social/activity', socialAuth, async (req, res) => {
 // Get friends' activity feed
 app.get('/api/social/activity/feed', socialAuth, async (req, res) => {
   try {
-    const { contentType, genre, userId } = req.query;
-    const activities = await social.getFriendsActivity(req.googleId, req.accessToken, {
-      contentType, genre, userId
+    const { contentType, genre, userId, page, pageSize } = req.query;
+    const feed = await social.getFriendsActivity(req.googleId, req.accessToken, {
+      contentType,
+      genre,
+      userId,
+      page: parsePositiveInt(page, 1),
+      pageSize: Math.min(parsePositiveInt(pageSize, 50), 100)
     });
-    res.json(activities);
+    res.json(feed);
   } catch (error) {
     res.status(500).json({ error: 'Failed to get activity feed' });
+  }
+});
+
+// Get available genres for activity filtering
+app.get('/api/social/activity/genres', socialAuth, async (req, res) => {
+  try {
+    if (!database.isConnected()) {
+      return res.json({ genres: [] });
+    }
+
+    const friends = await database.getFriends(req.googleId);
+    const friendIds = friends.map((friend) => friend.id).filter(Boolean);
+
+    if (friendIds.length === 0) {
+      return res.json({ genres: [] });
+    }
+
+    const genres = await database.getGenresFromActivities(req.googleId, friendIds);
+    return res.json({ genres });
+  } catch (error) {
+    console.error('[Social API] Failed to get activity genres:', error);
+    return res.status(500).json({ error: 'Failed to get activity genres' });
   }
 });
 
@@ -3678,6 +3912,53 @@ app.get('/api/social/chat/:friendId', socialAuth, async (req, res) => {
   }
 });
 
+// Get unread chat counts
+app.get('/api/social/chat/unread/count', socialAuth, async (req, res) => {
+  try {
+    if (!database.isConnected()) {
+      return res.json({
+        totalUnread: 0,
+        unreadByUser: {},
+        lastMessageAtByUser: {}
+      });
+    }
+
+    const [totalUnread, unreadUsers] = await Promise.all([
+      database.getUnreadCount(req.googleId),
+      database.getUsersWithUnreadMessages(req.googleId)
+    ]);
+
+    const unreadByUser = {};
+    const lastMessageAtByUser = {};
+
+    for (const row of unreadUsers) {
+      if (!row?.senderId) continue;
+      unreadByUser[row.senderId] = Number(row.count) || 0;
+      lastMessageAtByUser[row.senderId] = Number(row.lastMessageAt) || 0;
+    }
+
+    return res.json({
+      totalUnread,
+      unreadByUser,
+      lastMessageAtByUser
+    });
+  } catch (error) {
+    console.error('[Social API] Failed to get unread chat counts:', error);
+    return res.status(500).json({ error: 'Failed to get unread chat counts' });
+  }
+});
+
+// Mark chat messages from a friend as read
+app.post('/api/social/chat/:friendId/read', socialAuth, async (req, res) => {
+  try {
+    const marked = await social.markChatMessagesAsRead(req.googleId, req.params.friendId);
+    return res.json({ success: true, marked });
+  } catch (error) {
+    console.error('[Social API] Failed to mark messages as read:', error);
+    return res.status(500).json({ error: 'Failed to mark messages as read' });
+  }
+});
+
 // Send direct message to friend (HTTP fallback + durable write path)
 app.post('/api/social/chat/:friendId', socialAuth, async (req, res) => {
   try {
@@ -3708,78 +3989,97 @@ app.post('/api/social/chat/:friendId', socialAuth, async (req, res) => {
 });
 
 // Create a new Watch Together room
-app.post('/api/watchtogether/rooms', (req, res) => {
-  const { media_id, media_title, media_match_key, host_nickname } = req.body;
+app.post('/api/watchtogether/rooms', async (req, res) => {
+  try {
+    const { media_id, media_title, media_match_key, host_nickname } = req.body;
 
-  if (!media_id || !media_title || !host_nickname) {
-    return res.status(400).json({ error: 'media_id, media_title, and host_nickname required' });
-  }
+    if (!media_id || !media_title || !host_nickname) {
+      return res.status(400).json({ error: 'media_id, media_title, and host_nickname required' });
+    }
 
-  // Generate unique room code
-  let code;
-  do {
-    code = generateRoomCode();
-  } while (rooms.has(code));
+    const code = await generateUniqueRoomCode();
+    const hostId = uuidv4();
+    const now = Date.now();
+    const room = {
+      code,
+      media_id,
+      media_title,
+      media_match_key: normalizeMediaMatchKey(media_match_key),
+      host_id: hostId,
+      state: 'waiting',
+      current_position: 0,
+      is_paused: true,
+      position_updated_at: now,
+      sync_mode: WT_SYNC_MODE,
+      participants: new Map(),
+      created_at: now,
+      lastActivity: now,
+      last_sync_from: hostId,
+      last_sync_at: now,
+      syncInterval: null,
+      pingInterval: null,
+    };
 
-  const hostId = uuidv4();
-  const room = {
-    code,
-    media_id,
-    media_title,
-    media_match_key: normalizeMediaMatchKey(media_match_key),
-    host_id: hostId,
-    state: 'waiting', // waiting, playing, paused
-    current_position: 0,
-    is_paused: true,
-    position_updated_at: Date.now(),
-    sync_mode: WT_SYNC_MODE,
-    participants: new Map(),
-    created_at: Date.now(),
-    lastActivity: Date.now(),
-    last_sync_from: hostId,
-    last_sync_at: Date.now(),
-    syncInterval: null,
-    pingInterval: null,
-  };
-
-  // Add host as first participant
-  room.participants.set(hostId, {
-    id: hostId,
-    nickname: host_nickname,
-    is_host: true,
-    is_ready: false,
-    joined_at: Date.now(),
-    ws: null,
-    rtt: 0,
-    rttAvg: 0,
-    lastPosition: 0,
-    lastPaused: true,
-    lastStateReport: Date.now(),
-    disconnectTimer: null,
-    disconnected_at: null,
-  });
-
-  rooms.set(code, room);
-  wtDebugLog(`[WT] Room created: ${code} by ${host_nickname}`);
-
-  res.json({
-    code,
-    host_id: hostId,
-    media_id,
-    media_title,
-    participants: [{
+    room.participants.set(hostId, {
       id: hostId,
       nickname: host_nickname,
       is_host: true,
-      is_ready: false
-    }]
-  });
+      is_ready: false,
+      joined_at: now,
+      ws: null,
+      rtt: 0,
+      rttAvg: 0,
+      lastPosition: 0,
+      lastPaused: true,
+      lastStateReport: now,
+      disconnectTimer: null,
+      disconnected_at: null,
+    });
+
+    rooms.set(code, room);
+    await persistRoomState(room);
+    await syncRoomParticipantsInRedis(room);
+    await logRoomEvent(code, {
+      type: 'room_created',
+      host_id: hostId,
+      host_nickname,
+      media_title
+    });
+
+    wtDebugLog(`[WT] Room created: ${code} by ${host_nickname}`);
+
+    return res.json({
+      code,
+      host_id: hostId,
+      media_id,
+      media_title,
+      participants: [{
+        id: hostId,
+        nickname: host_nickname,
+        is_host: true,
+        is_ready: false
+      }]
+    });
+  } catch (error) {
+    console.error('[WT] Failed to create room:', error);
+    return res.status(500).json({ error: 'Failed to create room' });
+  }
 });
 
 // Get room info
-app.get('/api/watchtogether/rooms/:code', (req, res) => {
+app.get('/api/watchtogether/rooms/:code', async (req, res) => {
   const { code } = req.params;
-  const room = rooms.get(code.toUpperCase());
+  const normalizedCode = code.toUpperCase();
+  let room = rooms.get(normalizedCode);
+
+  if (!room && redis.isConnected()) {
+    const persistedRoom = await redis.getRoomState(normalizedCode);
+    if (persistedRoom) {
+      room = hydrateRecoveredRoom(persistedRoom);
+      rooms.set(normalizedCode, room);
+      startRoomSyncTimers(room);
+    }
+  }
 
   if (!room) {
     return res.status(404).json({ error: 'Room not found' });
@@ -3804,11 +4104,13 @@ app.get('/api/watchtogether/rooms/:code', (req, res) => {
 });
 
 // Delete/close a room
-app.delete('/api/watchtogether/rooms/:code', (req, res) => {
+app.delete('/api/watchtogether/rooms/:code', async (req, res) => {
   const { code } = req.params;
-  const room = rooms.get(code.toUpperCase());
+  const normalizedCode = code.toUpperCase();
+  const room = rooms.get(normalizedCode);
 
   if (!room) {
+    await deletePersistedRoom(normalizedCode);
     return res.status(404).json({ error: 'Room not found' });
   }
 
@@ -3820,14 +4122,14 @@ app.delete('/api/watchtogether/rooms/:code', (req, res) => {
   }
 
   stopRoomSyncTimers(room);
-  rooms.delete(code.toUpperCase());
+  rooms.delete(normalizedCode);
+  await deletePersistedRoom(normalizedCode);
   wtDebugLog(`[WT] Room deleted: ${code}`);
 
   res.json({ success: true });
 });
 
-// Step 1: Initiate OAuth flow
-app.get('/auth/google', (req, res) => {
+function redirectToGoogleAuth(req, res, scopes) {
   const redirectUri = getRedirectUri(req);
   const state = req.query.state || 'default';
 
@@ -3840,13 +4142,23 @@ app.get('/auth/google', (req, res) => {
   authUrl.searchParams.set('client_id', GOOGLE_CLIENT_ID);
   authUrl.searchParams.set('redirect_uri', redirectUri);
   authUrl.searchParams.set('response_type', 'code');
-  authUrl.searchParams.set('scope', SCOPES);
+  authUrl.searchParams.set('scope', scopes);
   authUrl.searchParams.set('access_type', 'offline');
   authUrl.searchParams.set('prompt', 'consent');
   authUrl.searchParams.set('state', state);
 
   wtDebugLog('Redirecting to Google with redirect_uri:', redirectUri);
-  res.redirect(authUrl.toString());
+  return res.redirect(authUrl.toString());
+}
+
+// Step 1: Initiate OAuth flow for Drive-enabled app auth
+app.get('/auth/google', (req, res) => {
+  return redirectToGoogleAuth(req, res, DRIVE_SCOPES);
+});
+
+// Step 1b: Initiate OAuth flow for Social-only auth
+app.get('/auth/google/social', (req, res) => {
+  return redirectToGoogleAuth(req, res, SOCIAL_SCOPES);
 });
 
 // Step 2: Handle Google callback
@@ -4040,7 +4352,7 @@ wss.on('connection', (ws, req) => {
 
   wtDebugLog(`[WT] WebSocket connection, room code: ${roomCode || 'none (will create)'}`);
 
-  ws.on('message', (data) => {
+  ws.on('message', async (data) => {
     try {
       const message = JSON.parse(data.toString());
 
@@ -4053,13 +4365,9 @@ wss.on('connection', (ws, req) => {
           return;
         }
 
-        // Generate unique room code
-        let newCode;
-        do {
-          newCode = generateRoomCode();
-        } while (rooms.has(newCode));
-
+        const newCode = await generateUniqueRoomCode();
         const hostId = client_id || uuidv4();
+        const now = Date.now();
         const room = {
           code: newCode,
           media_id,
@@ -4069,13 +4377,13 @@ wss.on('connection', (ws, req) => {
           state: 'waiting',
           current_position: 0,
           is_paused: true,
-          position_updated_at: Date.now(), // Track when position was last set
+          position_updated_at: now, // Track when position was last set
           sync_mode: WT_SYNC_MODE,
           participants: new Map(),
-          created_at: Date.now(),
-          lastActivity: Date.now(),
+          created_at: now,
+          lastActivity: now,
           last_sync_from: hostId,
-          last_sync_at: Date.now(),
+          last_sync_at: now,
           syncInterval: null, // Will hold the periodic state broadcast timer
           pingInterval: null, // Will hold the periodic ping timer
         };
@@ -4086,13 +4394,13 @@ wss.on('connection', (ws, req) => {
           nickname: nickname,
           is_host: true,
           is_ready: false,
-          joined_at: Date.now(),
+          joined_at: now,
           ws: ws,
           rtt: 0, // Round-trip time in ms
           rttAvg: 0, // Smoothed RTT (moving average)
           lastPosition: 0, // Last reported position
           lastPaused: true, // Last reported pause state
-          lastStateReport: Date.now(),
+          lastStateReport: now,
           disconnectTimer: null,
           disconnected_at: null,
         });
@@ -4104,6 +4412,15 @@ wss.on('connection', (ws, req) => {
         roomCode = newCode;
         currentRoom = room;
         participantId = hostId;
+
+        await persistRoomState(room);
+        await syncRoomParticipantsInRedis(room);
+        await logRoomEvent(newCode, {
+          type: 'room_created',
+          host_id: hostId,
+          nickname,
+          media_title
+        });
 
         wtDebugLog(`[WT] Room created via WebSocket: ${newCode} by ${nickname}`);
 
@@ -4137,6 +4454,15 @@ wss.on('connection', (ws, req) => {
         if (joinRoomCode) {
           room = rooms.get(joinRoomCode);
           roomCode = joinRoomCode;
+        }
+      }
+
+      if (!room && roomCode && redis.isConnected()) {
+        const persistedRoom = await redis.getRoomState(roomCode);
+        if (persistedRoom) {
+          room = hydrateRecoveredRoom(persistedRoom);
+          rooms.set(roomCode, room);
+          startRoomSyncTimers(room);
         }
       }
 
@@ -4227,6 +4553,9 @@ wss.on('connection', (ws, req) => {
             room.participants.set(participantId, participant);
           }
 
+          currentRoom = room;
+          room.lastActivity = Date.now();
+
           wtDebugLog(`[WT] ${participant.nickname} ${isReconnect ? 'reconnected to' : 'joined'} room ${room.code}`);
 
           const currentPosition = getServerPosition(room);
@@ -4268,6 +4597,14 @@ wss.on('connection', (ws, req) => {
               }
             }, participantId);
           }
+
+          await persistRoomState(room);
+          await syncRoomParticipantsInRedis(room);
+          await logRoomEvent(room.code, {
+            type: isReconnect ? 'participant_reconnected' : 'participant_joined',
+            participant_id: participantId,
+            nickname: participant.nickname
+          });
           break;
         }
 
@@ -4275,6 +4612,7 @@ wss.on('connection', (ws, req) => {
           // Participant is ready to start
           const participant = room.participants.get(participantId);
           if (participant) {
+            room.lastActivity = Date.now();
             participant.is_ready = true;
             if (message.duration !== undefined && message.duration !== null) {
               participant.duration = message.duration;
@@ -4293,6 +4631,14 @@ wss.on('connection', (ws, req) => {
             broadcastToRoom(room, {
               type: 'room_state',
               room: getRoomState(room)
+            });
+
+            await persistRoomState(room);
+            await syncRoomParticipantsInRedis(room);
+            await logRoomEvent(room.code, {
+              type: 'participant_ready',
+              participant_id: participantId,
+              duration: message.duration || 0
             });
           }
           break;
@@ -4319,6 +4665,7 @@ wss.on('connection', (ws, req) => {
             room.is_paused = false;
             room.current_position = normalizeSyncPosition(message.position, 0);
             room.position_updated_at = now;
+            room.lastActivity = now;
             room.last_sync_from = participantId;
             room.last_sync_at = now;
             participant.lastPosition = room.current_position;
@@ -4331,6 +4678,13 @@ wss.on('connection', (ws, req) => {
               type: 'playback_started',
               position: room.current_position,
               timestamp: now
+            });
+
+            await persistRoomState(room);
+            await logRoomEvent(room.code, {
+              type: 'playback_started',
+              participant_id: participantId,
+              position: room.current_position
             });
           }
           break;
@@ -4363,6 +4717,7 @@ wss.on('connection', (ws, req) => {
 
           room.current_position = commandPosition;
           room.position_updated_at = now;
+          room.lastActivity = now;
           room.last_sync_from = participantId;
           room.last_sync_at = now;
 
@@ -4392,6 +4747,14 @@ wss.on('connection', (ws, req) => {
               p.ws.send(JSON.stringify(msg));
             }
           }
+
+          await persistRoomState(room);
+          await logRoomEvent(room.code, {
+            type: 'sync',
+            participant_id: participantId,
+            action: normalizedAction,
+            position: commandPosition
+          });
           break;
         }
 
@@ -4401,6 +4764,7 @@ wss.on('connection', (ws, req) => {
           const participant = room.participants.get(participantId);
           if (participant) {
             const now = Date.now();
+            room.lastActivity = now;
             const reportPosition = Number(message.position);
             const hasPosition = Number.isFinite(reportPosition);
             const normalizedPosition = hasPosition
@@ -4421,6 +4785,7 @@ wss.on('connection', (ws, req) => {
                 room.position_updated_at = now;
                 room.is_paused = reportPaused;
                 room.state = reportPaused ? 'paused' : 'playing';
+                await persistRoomState(room);
               }
             }
           }
@@ -4460,6 +4825,7 @@ wss.on('connection', (ws, req) => {
 
         case 'heartbeat': {
           // Update last activity and optionally sync position
+          room.lastActivity = Date.now();
           if (message.position !== undefined) {
             const participant = room.participants.get(participantId);
             if (participant) {
@@ -4471,7 +4837,7 @@ wss.on('connection', (ws, req) => {
         }
 
         case 'leave': {
-          handleParticipantLeave(room, participantId);
+          await handleParticipantLeave(room, participantId);
           break;
         }
 
@@ -4484,10 +4850,10 @@ wss.on('connection', (ws, req) => {
     }
   });
 
-  ws.on('close', () => {
+  ws.on('close', async () => {
     wtDebugLog(`[WT] WebSocket closed for participant: ${participantId}`);
     if (currentRoom && participantId) {
-      handleSocketClose(currentRoom, participantId, ws);
+      await handleSocketClose(currentRoom, participantId, ws);
     }
   });
 
@@ -4583,7 +4949,7 @@ function stopRoomSyncTimers(room) {
   }
 }
 
-function handleSocketClose(room, participantId, ws) {
+async function handleSocketClose(room, participantId, ws) {
   const participant = room.participants.get(participantId);
   if (!participant) return;
 
@@ -4594,17 +4960,26 @@ function handleSocketClose(room, participantId, ws) {
 
   participant.ws = null;
   participant.disconnected_at = Date.now();
+  room.lastActivity = Date.now();
 
   if (participant.disconnectTimer) {
     clearTimeout(participant.disconnectTimer);
   }
 
   participant.disconnectTimer = setTimeout(() => {
-    handleParticipantLeave(room, participantId);
+    void handleParticipantLeave(room, participantId);
   }, DISCONNECT_GRACE_MS);
+
+  await persistRoomState(room);
+  await syncRoomParticipantsInRedis(room);
+  await logRoomEvent(room.code, {
+    type: 'participant_disconnected',
+    participant_id: participantId,
+    nickname: participant.nickname
+  });
 }
 
-function handleParticipantLeave(room, participantId) {
+async function handleParticipantLeave(room, participantId) {
   const participant = room.participants.get(participantId);
   if (!participant) return;
 
@@ -4614,7 +4989,9 @@ function handleParticipantLeave(room, participantId) {
   }
 
   const wasHost = participant.is_host;
+  const previousHostId = room.host_id;
   room.participants.delete(participantId);
+  room.lastActivity = Date.now();
   if (room.last_sync_from === participantId) {
     room.last_sync_from = null;
     room.last_sync_at = Date.now();
@@ -4632,15 +5009,44 @@ function handleParticipantLeave(room, participantId) {
       room.last_sync_at = Date.now();
     }
     wtDebugLog(`[WT] New host: ${newHost.nickname}`);
+
+    await logRoomEvent(room.code, {
+      type: 'host_migrated',
+      old_host_id: previousHostId,
+      new_host_id: newHost.id,
+      new_host_nickname: newHost.nickname
+    });
+
+    broadcastToRoom(room, {
+      type: 'host_migrated',
+      old_host_id: previousHostId,
+      new_host_id: newHost.id,
+      new_host_nickname: newHost.nickname,
+      room: getRoomState(room)
+    });
   }
 
   // If room is empty, delete it and stop timers
   if (room.participants.size === 0) {
     stopRoomSyncTimers(room);
     rooms.delete(room.code);
+    await logRoomEvent(room.code, {
+      type: 'room_deleted',
+      reason: 'empty'
+    });
+    await deletePersistedRoom(room.code);
     wtDebugLog(`[WT] Room ${room.code} deleted (empty)`);
     return;
   }
+
+  await removeRoomParticipantFromRedis(room.code, participantId);
+  await persistRoomState(room);
+  await syncRoomParticipantsInRedis(room);
+  await logRoomEvent(room.code, {
+    type: 'participant_left',
+    participant_id: participantId,
+    nickname: participant.nickname
+  });
 
   // Notify remaining participants
   broadcastToRoom(room, {
@@ -4682,11 +5088,14 @@ function getRoomState(room) {
 (async () => {
   // Initialize Turso database
   await database.initDatabase();
+  redis.initRedis();
+  await recoverRoomsFromRedis();
 
   server.listen(PORT, () => {
     console.log(`StreamVault Auth Server running on port ${PORT}`);
     console.log(`WebSocket endpoint: ws://localhost:${PORT}/ws/watchtogether/{roomCode}`);
     console.log(`Database connected: ${database.isConnected()}`);
+    console.log(`Redis connected: ${redis.isConnected()}`);
     if (!RUNTIME_METRICS_PASSWORD) {
       console.warn('[SECURITY] Runtime metrics auth disabled until RUNTIME_METRICS_PASSWORD is configured');
     } else {
