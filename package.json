@@ -10,7 +10,7 @@
     "test:wan:tauri": "node scripts/run-tauri-wan-e2e.js"
   },
   "dependencies": {
-    "@libsql/client": "^0.17.0",
+    "@libsql/client": "^0.17.2",
     "@upstash/redis": "^1.37.0",
     "cors": "^2.8.5",
     "dotenv": "^17.3.1",
